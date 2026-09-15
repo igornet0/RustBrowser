@@ -1,0 +1,27 @@
+[package]
+name = "browser-profile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Profiles, history, bookmarks, settings, session, downloads (SQLite)"
+
+[dependencies]
+browser-core = { workspace = true }
+chrono = { workspace = true }
+directories = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+lz4_flex = "0.11"
+plist = "1"
+keyring = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

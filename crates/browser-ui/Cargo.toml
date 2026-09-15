@@ -1,0 +1,25 @@
+[package]
+name = "browser-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Desktop UI: winit window + egui chrome + Servo content"
+
+[dependencies]
+browser-core = { workspace = true }
+browser-engine = { workspace = true }
+browser-profile = { workspace = true }
+browser-ipc = { workspace = true }
+egui = { workspace = true }
+egui_glow = { workspace = true, features = ["winit"] }
+egui-winit = { workspace = true }
+euclid = { workspace = true }
+glow = { workspace = true }
+raw-window-handle = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+winit = { workspace = true }
+servo = { workspace = true }
+image = { workspace = true }
+rfd = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "browser-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Rust Browser application binary"
+
+[[bin]]
+name = "rust-browser"
+path = "src/main.rs"
+
+[dependencies]
+browser-core = { workspace = true }
+browser-engine = { workspace = true }
+browser-ui = { workspace = true }
+rustls = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

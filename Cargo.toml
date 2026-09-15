@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/browser-core",
+    "crates/browser-engine",
+    "crates/browser-profile",
+    "crates/browser-ui",
+    "crates/browser-app",
+    "crates/browser-ipc",
+]
+default-members = ["crates/browser-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+rust-version = "1.88"
+authors = ["Rust Browser Contributors"]
+repository = "https://github.com/igornet0/RustBrowser"
+
+[workspace.dependencies]
+browser-core = { path = "crates/browser-core" }
+browser-engine = { path = "crates/browser-engine" }
+browser-profile = { path = "crates/browser-profile" }
+browser-ui = { path = "crates/browser-ui" }
+browser-ipc = { path = "crates/browser-ipc" }
+
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+euclid = "0.22"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2.5", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Engine / windowing — versions aligned with servo 0.5.0 examples
+servo = { version = "=0.5.0", default-features = true }
+winit = "0.30.13"
+egui = "0.34"
+egui-winit = "0.34"
+egui_glow = "0.34"
+glow = "0.17"
+raw-window-handle = "0.6"
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "aws_lc_rs"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs", "io-util"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
+
+keyring = "3"
+aes-gcm = "0.10"
+rand = "0.8"
+zeroize = "1"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

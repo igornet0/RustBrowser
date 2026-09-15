@@ -1,0 +1,23 @@
+[package]
+name = "browser-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Browser engine abstraction and Servo backend"
+
+[features]
+default = []
+media = []
+
+[dependencies]
+browser-core = { workspace = true }
+browser-ipc = { workspace = true }
+euclid = { workspace = true }
+servo = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+url = { workspace = true }
+winit = { workspace = true }
+raw-window-handle = { workspace = true }
+glow = { workspace = true }
