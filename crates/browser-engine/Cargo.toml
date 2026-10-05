@@ -19,5 +19,9 @@ tracing = { workspace = true }
 serde = { workspace = true }
 url = { workspace = true }
 winit = { workspace = true }
+image = { workspace = true }
+http = "1"
+base64 = "0.22"
+serde_json = { workspace = true }
 raw-window-handle = { workspace = true }
 glow = { workspace = true }

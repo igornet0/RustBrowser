@@ -7,11 +7,12 @@ members = [
     "crates/browser-ui",
     "crates/browser-app",
     "crates/browser-ipc",
+    "crates/browser-automation",
 ]
 default-members = ["crates/browser-app"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.88"
@@ -24,6 +25,7 @@ browser-engine = { path = "crates/browser-engine" }
 browser-profile = { path = "crates/browser-profile" }
 browser-ui = { path = "crates/browser-ui" }
 browser-ipc = { path = "crates/browser-ipc" }
+browser-automation = { path = "crates/browser-automation" }
 
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }

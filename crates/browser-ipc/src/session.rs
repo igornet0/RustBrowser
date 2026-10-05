@@ -1,12 +1,15 @@
 //! Browser-side session to a remote Content Process (Unix IPC).
+//!
+//! Shared by the desktop UI and the headless automation server.
 
 use browser_core::{
     BrowserError, BrowserResult, ContentProcessId, ContentProcessManager, ContentProcessState,
     RestartDecision, TabId,
 };
-use browser_ipc::{
+use crate::{
     content_msg_tab, listen_unix, validate_content_to_browser, BrowserToContent, ContentToBrowser,
-    Envelope, FrameBuffer, InboundOrder, InputEventMsg, IpcReader, IpcWriter, PROTOCOL_VERSION,
+    Envelope, FrameBuffer, InboundOrder, InputEventMsg, IpcError, IpcReader, IpcWriter,
+    PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,6 +24,8 @@ pub struct RemoteContentSession {
     reader: Option<IpcReader>,
     pub last_frames: HashMap<TabId, FrameBuffer>,
     pub pending_events: Vec<ContentToBrowser>,
+    /// Replies to request/response commands (script, screenshot), keyed by `request_id`.
+    pending_replies: HashMap<u64, ContentToBrowser>,
     pub crash_loop_locked: bool,
     restart_after: Option<Instant>,
     next_request_id: u64,
@@ -43,8 +48,20 @@ impl RemoteContentSession {
         exe: PathBuf,
         host_file: Option<PathBuf>,
     ) -> BrowserResult<Self> {
+        Self::start_with_options(content_dir, socket_dir, exe, host_file, Vec::new())
+    }
+
+    /// Like [`Self::start_with_host_file`], passing `extra_args` to every content spawn.
+    pub fn start_with_options(
+        content_dir: PathBuf,
+        socket_dir: PathBuf,
+        exe: PathBuf,
+        host_file: Option<PathBuf>,
+        extra_args: Vec<String>,
+    ) -> BrowserResult<Self> {
         let mut manager =
             ContentProcessManager::with_host_file(content_dir, socket_dir, exe, host_file)?;
+        manager.extra_args = extra_args;
         let process_id = ContentProcessId::new();
         let path = manager.socket_for(process_id);
         let listener = listen_unix(&path).map_err(|e| BrowserError::Other(e.to_string()))?;
@@ -58,6 +75,7 @@ impl RemoteContentSession {
             reader: None,
             last_frames: HashMap::new(),
             pending_events: Vec::new(),
+            pending_replies: HashMap::new(),
             crash_loop_locked: false,
             restart_after: None,
             next_request_id: 1,
@@ -167,6 +185,10 @@ impl RemoteContentSession {
     }
 
     fn send(&mut self, payload: BrowserToContent) -> BrowserResult<()> {
+        self.send_with_rid(payload).map(|_| ())
+    }
+
+    fn send_with_rid(&mut self, payload: BrowserToContent) -> BrowserResult<u64> {
         let rid = self.alloc_rid();
         let seq = self.alloc_seq();
         let Some(writer) = self.writer.as_mut() else {
@@ -175,7 +197,8 @@ impl RemoteContentSession {
         writer.generation = self.generation;
         writer
             .send(&Envelope::full(rid, self.generation, seq, payload))
-            .map_err(|e| BrowserError::Other(e.to_string()))
+            .map_err(|e| BrowserError::Other(e.to_string()))?;
+        Ok(rid)
     }
 
     pub fn create_tab(&mut self, tab_id: TabId, url: Option<Url>) -> BrowserResult<()> {
@@ -247,6 +270,31 @@ impl RemoteContentSession {
         self.send(BrowserToContent::RequestFrame { tab_id })
     }
 
+    /// Start a script evaluation; poll, then fetch the answer with [`Self::take_reply`].
+    pub fn evaluate_script(&mut self, tab_id: TabId, script: String) -> BrowserResult<u64> {
+        self.send_with_rid(BrowserToContent::EvaluateScript { tab_id, script })
+    }
+
+    /// Request the tab's network log; the answer arrives via [`Self::take_reply`].
+    pub fn network_log(&mut self, tab_id: TabId) -> BrowserResult<u64> {
+        self.send_with_rid(BrowserToContent::GetNetworkLog { tab_id })
+    }
+
+    /// Request a PNG screenshot; the answer arrives via [`Self::take_reply`].
+    pub fn capture_screenshot(&mut self, tab_id: TabId) -> BrowserResult<u64> {
+        self.send_with_rid(BrowserToContent::CaptureScreenshot { tab_id })
+    }
+
+    /// Reply to a request/response command, once [`Self::poll`] has received it.
+    pub fn take_reply(&mut self, request_id: u64) -> Option<ContentToBrowser> {
+        self.pending_replies.remove(&request_id)
+    }
+
+    /// Drop a reply that will no longer be awaited (timed out / cancelled).
+    pub fn forget_reply(&mut self, request_id: u64) {
+        self.pending_replies.remove(&request_id);
+    }
+
     pub fn poll(&mut self) -> BrowserResult<Vec<ContentToBrowser>> {
         self.pump_reader()?;
         self.maybe_heartbeat()?;
@@ -291,26 +339,32 @@ impl RemoteContentSession {
                         ContentToBrowser::Frame { tab_id, frame } => {
                             self.last_frames.insert(*tab_id, frame.clone());
                         }
+                        ContentToBrowser::ScriptResult { .. }
+                        | ContentToBrowser::Screenshot { .. }
+                        | ContentToBrowser::NetworkLog { .. } => {
+                            self.pending_replies.insert(env.request_id, env.payload);
+                            continue;
+                        }
                         _ => {}
                     }
                     self.pending_events.push(env.payload);
                 }
                 Ok(None) => break,
-                Err(browser_ipc::IpcError::Disconnected) => {
+                Err(IpcError::Disconnected) => {
                     warn!("content ipc disconnected");
                     self.handle_death()?;
                     break;
                 }
-                Err(browser_ipc::IpcError::Validation(msg)) => {
+                Err(IpcError::Validation(msg)) => {
                     warn!(%msg, "ipc validation failed — fail-closed drop");
                     continue;
                 }
-                Err(browser_ipc::IpcError::VersionMismatch { expected, got }) => {
+                Err(IpcError::VersionMismatch { expected, got }) => {
                     return Err(BrowserError::Other(format!(
                         "protocol mismatch expected={expected} got={got}"
                     )));
                 }
-                Err(browser_ipc::IpcError::TooLarge(n)) => {
+                Err(IpcError::TooLarge(n)) => {
                     warn!(n, "oversized content message dropped");
                     continue;
                 }

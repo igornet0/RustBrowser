@@ -11,7 +11,7 @@ mod site_data;
 mod traits;
 mod ui_surface;
 
-pub use content_runtime::run_content_process;
+pub use content_runtime::{run_content_process, ContentOptions};
 pub use events::{EngineEvent, EngineViewId};
 pub use identity::{build_preferences, desktop_user_agent};
 pub use servo_backend::{ServoEngine, ServoEngineConfig};

@@ -11,8 +11,90 @@ fn tab() -> TabId {
 }
 
 #[test]
-fn protocol_version_is_v3() {
-    assert_eq!(PROTOCOL_VERSION, 3);
+fn protocol_version_is_v4() {
+    assert_eq!(PROTOCOL_VERSION, 4);
+}
+
+#[test]
+fn roundtrip_script_and_screenshot_messages() {
+    let tab_id = tab();
+    let req = Envelope::new(
+        5,
+        BrowserToContent::EvaluateScript {
+            tab_id,
+            script: "document.title".into(),
+        },
+    );
+    let back: Envelope<BrowserToContent> =
+        serde_json::from_slice(&serde_json::to_vec(&req).unwrap()).unwrap();
+    assert!(matches!(back.payload, BrowserToContent::EvaluateScript { .. }));
+
+    let reply = Envelope::new(
+        5,
+        ContentToBrowser::ScriptResult {
+            tab_id,
+            result: Ok(serde_json::json!({ "title": "Example", "links": [1, 2] })),
+        },
+    );
+    let back: Envelope<ContentToBrowser> =
+        serde_json::from_slice(&serde_json::to_vec(&reply).unwrap()).unwrap();
+    assert_eq!(back.request_id, 5);
+    match back.payload {
+        ContentToBrowser::ScriptResult { result: Ok(v), .. } => assert_eq!(v["title"], "Example"),
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(crate::content_msg_tab(&ContentToBrowser::Screenshot {
+        tab_id,
+        result: Ok("iVBOR".into()),
+    }), Some(tab_id));
+}
+
+#[test]
+fn network_log_roundtrip_and_bounds() {
+    use crate::{validate_content_to_browser, NetworkRequestMsg, MAX_NETWORK_LOG};
+    let tab_id = tab();
+    let req = NetworkRequestMsg {
+        url: "https://shop.test/api/products?page=1".into(),
+        method: "GET".into(),
+        destination: "empty".into(),
+        main_frame: false,
+        blocked: false,
+    };
+    let msg = ContentToBrowser::NetworkLog {
+        tab_id,
+        requests: vec![req.clone()],
+    };
+    let back: ContentToBrowser = serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();
+    match back {
+        ContentToBrowser::NetworkLog { requests, .. } => assert_eq!(requests, vec![req.clone()]),
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(validate_content_to_browser(&ContentToBrowser::NetworkLog {
+        tab_id,
+        requests: vec![req; MAX_NETWORK_LOG + 1],
+    })
+    .is_err());
+}
+
+#[test]
+fn script_validation_bounds() {
+    use crate::{validate_browser_to_content, MAX_SCRIPT_LENGTH};
+    let tab_id = tab();
+    assert!(validate_browser_to_content(&BrowserToContent::EvaluateScript {
+        tab_id,
+        script: "1 + 1".into(),
+    })
+    .is_ok());
+    assert!(validate_browser_to_content(&BrowserToContent::EvaluateScript {
+        tab_id,
+        script: "   ".into(),
+    })
+    .is_err());
+    assert!(validate_browser_to_content(&BrowserToContent::EvaluateScript {
+        tab_id,
+        script: "x".repeat(MAX_SCRIPT_LENGTH + 1),
+    })
+    .is_err());
 }
 
 #[test]

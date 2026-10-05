@@ -25,5 +25,5 @@ pub use process_manager::{
     ContentProcessState, CrashLoopConfig, ProcessAssignmentPolicy, RestartDecision, SiteKey,
 };
 pub use tab::{Tab, TabId, TabState};
-pub use url_util::normalize_url;
+pub use url_util::{is_private_network_url, normalize_url};
 pub use watchdog::{Watchdog, WatchdogConfig, WatchdogStatus};

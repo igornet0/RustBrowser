@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Bump when breaking wire format. Mismatch → content process rejected.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope<T> {
@@ -116,12 +116,41 @@ pub enum BrowserToContent {
     RequestFrame {
         tab_id: TabId,
     },
+    /// Evaluate JavaScript in the tab's main frame. Answered by
+    /// [`ContentToBrowser::ScriptResult`] with the same `request_id`.
+    EvaluateScript {
+        tab_id: TabId,
+        script: String,
+    },
+    /// PNG screenshot of the viewport once the page has settled (fonts, images).
+    /// Answered by [`ContentToBrowser::Screenshot`] with the same `request_id`.
+    CaptureScreenshot {
+        tab_id: TabId,
+    },
+    /// Requests the tab has made so far (automation network log).
+    /// Answered by [`ContentToBrowser::NetworkLog`] with the same `request_id`.
+    GetNetworkLog {
+        tab_id: TabId,
+    },
     /// Apply proxy routing policy (no secrets — host/port/scheme only).
     SetNetworkRoute {
         mode: NetworkRouteMsg,
     },
     Heartbeat,
     Shutdown,
+}
+
+/// One resource request seen by the engine (no bodies — those come from the page hook).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkRequestMsg {
+    pub url: String,
+    pub method: String,
+    /// Fetch destination: `document`, `script`, `image`, … `empty` = fetch()/XHR.
+    pub destination: String,
+    pub main_frame: bool,
+    /// Blocked by the content process (private network in automation mode).
+    #[serde(default)]
+    pub blocked: bool,
 }
 
 /// Serializable proxy/route hint for Content (P1.2 boundary prep — not full Network Core).
@@ -219,6 +248,22 @@ pub enum ContentToBrowser {
         tab_id: TabId,
         reason: String,
     },
+    /// Reply to [`BrowserToContent::EvaluateScript`] (same `request_id`).
+    /// DOM nodes / windows come back as opaque id strings.
+    ScriptResult {
+        tab_id: TabId,
+        result: Result<serde_json::Value, String>,
+    },
+    /// Reply to [`BrowserToContent::CaptureScreenshot`] (same `request_id`).
+    Screenshot {
+        tab_id: TabId,
+        result: Result<String, String>,
+    },
+    /// Reply to [`BrowserToContent::GetNetworkLog`] (same `request_id`).
+    NetworkLog {
+        tab_id: TabId,
+        requests: Vec<NetworkRequestMsg>,
+    },
     Error {
         tab_id: Option<TabId>,
         message: String,
@@ -261,7 +306,10 @@ pub fn content_msg_tab(msg: &ContentToBrowser) -> Option<TabId> {
         | ContentToBrowser::HistoryChanged { tab_id, .. }
         | ContentToBrowser::Frame { tab_id, .. }
         | ContentToBrowser::ConsoleMessage { tab_id, .. }
-        | ContentToBrowser::TabCrashed { tab_id, .. } => Some(*tab_id),
+        | ContentToBrowser::TabCrashed { tab_id, .. }
+        | ContentToBrowser::ScriptResult { tab_id, .. }
+        | ContentToBrowser::Screenshot { tab_id, .. }
+        | ContentToBrowser::NetworkLog { tab_id, .. } => Some(*tab_id),
         ContentToBrowser::Error { tab_id, .. } => *tab_id,
         _ => None,
     }

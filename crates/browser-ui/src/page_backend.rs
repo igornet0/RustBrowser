@@ -2,7 +2,7 @@
 //!
 //! After P1.1 the default path never constructs `Servo` / `WebView` in the Browser process.
 
-use crate::remote_content::RemoteContentSession;
+use browser_ipc::RemoteContentSession;
 use browser_core::{BrowserError, BrowserResult, TabId};
 use browser_engine::{
     BrowserEngine, EngineEvent, EngineViewId, ServoEngine, ServoEngineConfig, UiSurface,

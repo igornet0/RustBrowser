@@ -61,6 +61,30 @@ fn nibble(n: u8) -> char {
     char::from(if n < 10 { b'0' + n } else { b'A' + (n - 10) })
 }
 
+/// localhost, `.local`, loopback / RFC 1918 / link-local / unique-local addresses.
+pub fn is_private_network_url(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local")
+        }
+        Some(url::Host::Ipv4(ip)) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return v4.is_loopback() || v4.is_private() || v4.is_link_local();
+            }
+            ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,4 +109,25 @@ mod tests {
         assert!(url.as_str().contains("duckduckgo.com"));
         assert!(url.as_str().contains("rust+browser+engine"));
     }
+
+    #[test]
+    fn private_network_urls_are_detected() {
+        for u in [
+            "http://localhost:8080/",
+            "http://api.localhost/",
+            "http://printer.local/",
+            "http://127.0.0.1/",
+            "http://10.0.0.5/",
+            "http://192.168.1.1/",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/",
+            "http://[::ffff:127.0.0.1]/",
+        ] {
+            assert!(is_private_network_url(&Url::parse(u).unwrap()), "{u}");
+        }
+        for u in ["https://example.com/", "http://8.8.8.8/", "data:text/plain,hi"] {
+            assert!(!is_private_network_url(&Url::parse(u).unwrap()), "{u}");
+        }
+    }
+
 }

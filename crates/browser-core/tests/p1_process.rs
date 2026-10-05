@@ -36,7 +36,7 @@ fn browser_exe() -> PathBuf {
 
 #[test]
 fn protocol_version_constant() {
-    assert_eq!(PROTOCOL_VERSION, 3);
+    assert_eq!(PROTOCOL_VERSION, 4);
 }
 
 #[test]

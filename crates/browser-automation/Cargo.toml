@@ -1,0 +1,20 @@
+[package]
+name = "browser-automation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Headless automation HTTP API (render / evaluate / screenshot) over the Content Process"
+
+[dependencies]
+browser-core = { workspace = true }
+browser-ipc = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { workspace = true, features = ["net", "time", "signal"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

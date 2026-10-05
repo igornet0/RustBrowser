@@ -140,6 +140,8 @@ pub struct ContentProcessManager {
     pub exe: PathBuf,
     /// Optional Servo hosts-format file passed to content as `--content-host-file`.
     pub host_file: Option<PathBuf>,
+    /// Extra flags for every spawned content process (e.g. `--automation-content`).
+    pub extra_args: Vec<String>,
     next_request_id: u64,
     next_generation: u64,
     /// When true, scheduled restarts must not spawn.
@@ -169,6 +171,7 @@ impl ContentProcessManager {
             socket_dir,
             exe,
             host_file,
+            extra_args: Vec::new(),
             next_request_id: 1,
             next_generation: 1,
             shutting_down: false,
@@ -226,6 +229,7 @@ impl ContentProcessManager {
                 cmd.arg("--content-host-file").arg(host_file);
             }
         }
+        cmd.args(&self.extra_args);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())

@@ -39,6 +39,10 @@ pub const MAX_TITLE_LENGTH: usize = 2 * 1024;
 pub const MAX_CONSOLE_LENGTH: usize = 8 * 1024;
 pub const MAX_KEY_LENGTH: usize = 128;
 pub const MAX_TEXT_INPUT_LENGTH: usize = 4 * 1024;
+/// Scripts sent for evaluation (automation): generous, but bounded.
+pub const MAX_SCRIPT_LENGTH: usize = 64 * 1024;
+/// Requests kept per tab in the automation network log.
+pub const MAX_NETWORK_LOG: usize = 300;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ValidationError {
@@ -189,6 +193,12 @@ pub fn validate_browser_to_content(msg: &BrowserToContent) -> Result<(), Validat
             }
         }
         BrowserToContent::Input { event, .. } => validate_input(event)?,
+        BrowserToContent::EvaluateScript { script, .. } => {
+            if script.trim().is_empty() {
+                return Err(ValidationError::InvalidPayload("empty script".into()));
+            }
+            check_str("script", script, MAX_SCRIPT_LENGTH)?;
+        }
         BrowserToContent::SetNetworkRoute { mode } => match mode {
             crate::protocol::NetworkRouteMsg::Direct => {}
             crate::protocol::NetworkRouteMsg::Proxy {
@@ -236,6 +246,21 @@ pub fn validate_content_to_browser(msg: &ContentToBrowser) -> Result<(), Validat
             check_str("error", reason, MAX_STRING_LENGTH)?;
         }
         ContentToBrowser::Frame { frame, .. } => validate_frame(frame)?,
+        // Script results / screenshots are bounded by MAX_MESSAGE_SIZE at the transport.
+        ContentToBrowser::NetworkLog { requests, .. } => {
+            if requests.len() > MAX_NETWORK_LOG {
+                return Err(ValidationError::InvalidPayload("network log too long".into()));
+            }
+            for r in requests {
+                check_str("request url", &r.url, MAX_URL_LENGTH)?;
+                check_str("request method", &r.method, 32)?;
+                check_str("request destination", &r.destination, 64)?;
+            }
+        }
+        ContentToBrowser::ScriptResult { result: Err(e), .. }
+        | ContentToBrowser::Screenshot { result: Err(e), .. } => {
+            check_str("error", e, MAX_STRING_LENGTH)?
+        }
         ContentToBrowser::LoadProgress { progress, .. } => {
             if !(0.0..=1.0).contains(progress) && !progress.is_nan() {
                 // Allow slightly out-of-range from engines; reject absurd values.

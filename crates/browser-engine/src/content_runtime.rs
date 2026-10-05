@@ -5,20 +5,23 @@
 
 use crate::events::EngineViewId;
 use crate::identity::build_preferences;
-use browser_core::{BrowserError, BrowserResult, TabId};
+use browser_core::{is_private_network_url, BrowserError, BrowserResult, TabId};
 use crate::ipc_keymap::{self, parse_ipc_key};
 use browser_ipc::{
     clamp_ipc_frame_size, connect_unix, validate_browser_to_content, BrowserToContent,
-    ContentToBrowser, Envelope, FrameBuffer, InputEventMsg, IpcReader, IpcWriter, NetworkRouteMsg,
-    PROTOCOL_VERSION,
+    ContentToBrowser, Envelope, FrameBuffer, InputEventMsg, IpcReader, IpcWriter,
+    NetworkRequestMsg, NetworkRouteMsg, MAX_NETWORK_LOG, PROTOCOL_VERSION,
 };
 use euclid::Scale;
 use servo::{
-    CompositionEvent, CompositionState, ImeEvent, InputEvent, KeyState, KeyboardEvent, LoadStatus,
-    Modifiers, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, RenderingContext,
-    Servo, ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate,
-    WheelDelta, WheelEvent, WheelMode,
+    CompositionEvent, CompositionState, ImeEvent, InputEvent, JSValue, JavaScriptEvaluationError,
+    KeyState, KeyboardEvent, LoadStatus, Modifiers, MouseButton, MouseButtonAction,
+    MouseButtonEvent, MouseMoveEvent, RenderingContext, Servo, ServoBuilder,
+    SoftwareRenderingContext, UserContentManager, UserScript, WebResourceLoad,
+    WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
+    WheelMode,
 };
+use base64::Engine as _;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +32,14 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use url::Url;
 use winit::dpi::PhysicalSize;
+
+/// Content process behaviour switches (from `browser-app` CLI flags).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContentOptions {
+    /// Headless automation (`--automation-content`): no periodic frames over IPC
+    /// and no requests to localhost / private networks.
+    pub automation: bool,
+}
 
 struct WakeFlag(Arc<AtomicBool>);
 
@@ -42,15 +53,25 @@ impl servo::EventLoopWaker for WakeFlag {
 }
 
 struct Shared {
-    events: Mutex<Vec<ContentToBrowser>>,
+    /// Outgoing messages; `Some(request_id)` marks a reply to a browser request.
+    events: Mutex<Vec<(Option<u64>, ContentToBrowser)>>,
     view_ids: RefCell<HashMap<servo::WebViewId, TabId>>,
     dirty: Mutex<bool>,
+    /// Tabs awaiting a screenshot: Servo captures during `paint`, so keep painting them.
+    screenshot_pending: RefCell<std::collections::HashSet<TabId>>,
+    /// Automation: every resource request per tab (bounded), for API discovery.
+    network: RefCell<HashMap<TabId, Vec<NetworkRequestMsg>>>,
 }
 
 impl Shared {
     fn push(&self, msg: ContentToBrowser) {
         if let Ok(mut q) = self.events.lock() {
-            q.push(msg);
+            q.push((None, msg));
+        }
+    }
+    fn push_reply(&self, request_id: u64, msg: ContentToBrowser) {
+        if let Ok(mut q) = self.events.lock() {
+            q.push((Some(request_id), msg));
         }
     }
     fn tab_for(&self, webview: &WebView) -> Option<TabId> {
@@ -60,9 +81,42 @@ impl Shared {
 
 struct Delegate {
     shared: Rc<Shared>,
+    block_private_network: bool,
 }
 
 impl WebViewDelegate for Delegate {
+    fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {
+        if !self.block_private_network {
+            return;
+        }
+        let blocked = is_private_network_url(&load.request().url);
+        if let Some(tab_id) = self.shared.tab_for(&webview) {
+            let request = load.request();
+            let mut network = self.shared.network.borrow_mut();
+            let log = network.entry(tab_id).or_default();
+            if log.len() < MAX_NETWORK_LOG {
+                log.push(NetworkRequestMsg {
+                    url: request.url.to_string(),
+                    method: request.method.to_string(),
+                    destination: format!("{:?}", request.destination).to_ascii_lowercase(),
+                    main_frame: request.is_for_main_frame,
+                    blocked,
+                });
+            }
+        }
+        if !blocked {
+            return;
+        }
+        let url = load.request().url.clone();
+        warn!(%url, "blocked private-network request (automation policy)");
+        // Dropping the intercepted load finishes it with an empty body.
+        let _ = load.intercept(
+            WebResourceResponse::new(url)
+                .status_code(http::StatusCode::FORBIDDEN)
+                .status_message(b"Blocked by automation policy".to_vec()),
+        );
+    }
+
     fn notify_new_frame_ready(&self, webview: WebView) {
         if let Ok(mut d) = self.shared.dirty.lock() {
             *d = true;
@@ -121,6 +175,8 @@ impl WebViewDelegate for Delegate {
 
 struct ContentRuntime {
     servo: Servo,
+    options: ContentOptions,
+    user_content: Option<Rc<UserContentManager>>,
     context: Rc<SoftwareRenderingContext>,
     views: HashMap<TabId, WebView>,
     focused: Option<TabId>,
@@ -132,7 +188,11 @@ struct ContentRuntime {
 }
 
 impl ContentRuntime {
-    fn new(storage: Option<PathBuf>, host_file: Option<PathBuf>) -> BrowserResult<Self> {
+    fn new(
+        storage: Option<PathBuf>,
+        host_file: Option<PathBuf>,
+        options: ContentOptions,
+    ) -> BrowserResult<Self> {
         let page_size = PhysicalSize::new(1280, 720);
         let context = Rc::new(
             SoftwareRenderingContext::new(page_size)
@@ -169,10 +229,23 @@ impl ContentRuntime {
             events: Mutex::new(Vec::new()),
             view_ids: RefCell::new(HashMap::new()),
             dirty: Mutex::new(true),
+            screenshot_pending: RefCell::new(Default::default()),
+            network: RefCell::new(HashMap::new()),
+        });
+        // Automation pages get the fetch/XHR recorder before their own scripts run.
+        let user_content = options.automation.then(|| {
+            let manager = Rc::new(UserContentManager::new(&servo));
+            manager.add_script(Rc::new(UserScript::new(
+                include_str!("network_hook.js").to_string(),
+                None,
+            )));
+            manager
         });
 
         Ok(Self {
             servo,
+            options,
+            user_content,
             context,
             views: HashMap::new(),
             focused: None,
@@ -190,6 +263,7 @@ impl ContentRuntime {
         }
         let delegate = Rc::new(Delegate {
             shared: self.shared.clone(),
+            block_private_network: self.options.automation,
         });
         let mut builder = WebViewBuilder::new(
             &self.servo,
@@ -197,6 +271,9 @@ impl ContentRuntime {
         )
         .hidpi_scale_factor(Scale::new(self.scale as f32))
         .delegate(delegate);
+        if let Some(manager) = &self.user_content {
+            builder = builder.user_content_manager(manager.clone());
+        }
         if let Some(url) = url {
             builder = builder.url(url);
         }
@@ -219,6 +296,8 @@ impl ContentRuntime {
         if let Some(wv) = self.views.remove(&tab_id) {
             self.shared.view_ids.borrow_mut().remove(&wv.id());
         }
+        self.shared.network.borrow_mut().remove(&tab_id);
+        self.shared.screenshot_pending.borrow_mut().remove(&tab_id);
         if self.focused == Some(tab_id) {
             self.focused = self.views.keys().next().copied();
         }
@@ -433,7 +512,53 @@ impl ContentRuntime {
         })
     }
 
-    fn drain_events(&self) -> Vec<ContentToBrowser> {
+    fn evaluate_script(&mut self, request_id: u64, tab_id: TabId, script: String) {
+        let Some(wv) = self.views.get(&tab_id) else {
+            self.shared.push_reply(
+                request_id,
+                ContentToBrowser::ScriptResult {
+                    tab_id,
+                    result: Err(format!("unknown tab {tab_id}")),
+                },
+            );
+            return;
+        };
+        let shared = self.shared.clone();
+        wv.evaluate_javascript(script, move |res| {
+            let result = res.map(|v| js_value_to_json(&v)).map_err(|e| script_error(&e));
+            shared.push_reply(request_id, ContentToBrowser::ScriptResult { tab_id, result });
+        });
+        self.servo.spin_event_loop();
+    }
+
+    fn capture_screenshot(&mut self, request_id: u64, tab_id: TabId) {
+        if !self.views.contains_key(&tab_id) {
+            self.shared.push_reply(
+                request_id,
+                ContentToBrowser::Screenshot {
+                    tab_id,
+                    result: Err(format!("unknown tab {tab_id}")),
+                },
+            );
+            return;
+        }
+        // Tabs share one rendering surface: only the focused one is painted.
+        self.focus(tab_id);
+        let shared = self.shared.clone();
+        if let Some(wv) = self.views.get(&tab_id) {
+            self.shared.screenshot_pending.borrow_mut().insert(tab_id);
+            wv.take_screenshot(None, move |res| {
+                shared.screenshot_pending.borrow_mut().remove(&tab_id);
+                let result = res
+                    .map_err(|e| format!("screenshot: {e:?}"))
+                    .and_then(|img| encode_png_base64(&img));
+                shared.push_reply(request_id, ContentToBrowser::Screenshot { tab_id, result });
+            });
+        }
+        self.servo.spin_event_loop();
+    }
+
+    fn drain_events(&self) -> Vec<(Option<u64>, ContentToBrowser)> {
         self.shared
             .events
             .lock()
@@ -444,6 +569,13 @@ impl ContentRuntime {
     fn spin(&mut self) {
         self.wake.store(false, Ordering::SeqCst);
         self.servo.spin_event_loop();
+        // Without the frame stream nothing else paints in automation mode.
+        let pending: Vec<TabId> = self.shared.screenshot_pending.borrow().iter().copied().collect();
+        for tab_id in pending {
+            if let Some(wv) = self.views.get(&tab_id) {
+                wv.paint();
+            }
+        }
     }
 }
 
@@ -452,6 +584,7 @@ pub fn run_content_process(
     socket: &Path,
     storage: Option<PathBuf>,
     host_file: Option<PathBuf>,
+    options: ContentOptions,
 ) -> BrowserResult<()> {
     info!(
         pid = std::process::id(),
@@ -477,7 +610,7 @@ pub fn run_content_process(
     let mut writer = IpcWriter::new(stream.try_clone().map_err(|e| BrowserError::engine(e.to_string()))?);
     let mut reader = IpcReader::new(stream);
 
-    let mut runtime = ContentRuntime::new(storage, host_file)?;
+    let mut runtime = ContentRuntime::new(storage, host_file, options)?;
     let mut next_id = 1u64;
 
     // Wait for Hello
@@ -650,6 +783,24 @@ pub fn run_content_process(
                             }
                         }
                     }
+                    BrowserToContent::EvaluateScript { tab_id, script } => {
+                        runtime.evaluate_script(rid, tab_id, script);
+                    }
+                    BrowserToContent::CaptureScreenshot { tab_id } => {
+                        runtime.capture_screenshot(rid, tab_id);
+                    }
+                    BrowserToContent::GetNetworkLog { tab_id } => {
+                        let requests = runtime
+                            .shared
+                            .network
+                            .borrow()
+                            .get(&tab_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        runtime
+                            .shared
+                            .push_reply(rid, ContentToBrowser::NetworkLog { tab_id, requests });
+                    }
                     BrowserToContent::SetNetworkRoute { mode } => {
                         // Boundary prep only — full Network Core is P2.
                         match mode {
@@ -684,18 +835,47 @@ pub fn run_content_process(
             }
         }
 
-        for msg in runtime.drain_events() {
-            next_id += 1;
+        for (reply_to, msg) in runtime.drain_events() {
+            let rid = match reply_to {
+                Some(rid) => rid,
+                None => {
+                    next_id += 1;
+                    next_id
+                }
+            };
+            let reply_kind = match &msg {
+                ContentToBrowser::ScriptResult { tab_id, .. } => Some((*tab_id, true)),
+                ContentToBrowser::Screenshot { tab_id, .. } => Some((*tab_id, false)),
+                _ => None,
+            };
             let seq = out_seq;
             out_seq += 1;
-            if send_out(&mut writer, next_id, seq, msg).is_err() {
-                running = false;
-                break;
+            match send_out(&mut writer, rid, seq, msg) {
+                Ok(()) => {}
+                // An oversized reply must not kill the process: answer with an error instead.
+                Err(browser_ipc::IpcError::TooLarge(n)) if reply_kind.is_some() => {
+                    warn!(n, "reply exceeds IPC budget");
+                    let (tab_id, is_script) = reply_kind.expect("checked");
+                    let err = format!("reply too large: {n} bytes");
+                    let replacement = if is_script {
+                        ContentToBrowser::ScriptResult { tab_id, result: Err(err) }
+                    } else {
+                        ContentToBrowser::Screenshot { tab_id, result: Err(err) }
+                    };
+                    let seq = out_seq;
+                    out_seq += 1;
+                    let _ = send_out(&mut writer, rid, seq, replacement);
+                }
+                Err(_) => {
+                    running = false;
+                    break;
+                }
             }
         }
 
-        // Throttled automatic frame for focused tab.
-        let dirty = runtime
+        // Throttled automatic frame for focused tab (not needed for headless automation).
+        let dirty = !runtime.options.automation
+            && runtime
             .shared
             .dirty
             .lock()
@@ -746,6 +926,66 @@ pub fn run_content_process(
 
     info!("content process shutdown");
     Ok(())
+}
+
+/// `JSValue` → JSON. DOM objects have no JSON form: they become `{"$type", "id"}`.
+fn js_value_to_json(value: &JSValue) -> serde_json::Value {
+    use serde_json::{json, Value};
+    match value {
+        JSValue::Undefined | JSValue::Null => Value::Null,
+        JSValue::Boolean(b) => Value::Bool(*b),
+        JSValue::Number(n) => serde_json::Number::from_f64(*n)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        JSValue::String(s) => Value::String(s.clone()),
+        JSValue::Element(id) => json!({ "$type": "element", "id": id }),
+        JSValue::ShadowRoot(id) => json!({ "$type": "shadow_root", "id": id }),
+        JSValue::Frame(id) => json!({ "$type": "frame", "id": id }),
+        JSValue::Window(id) => json!({ "$type": "window", "id": id }),
+        JSValue::Array(items) => Value::Array(items.iter().map(js_value_to_json).collect()),
+        JSValue::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), js_value_to_json(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn script_error(err: &JavaScriptEvaluationError) -> String {
+    match err {
+        JavaScriptEvaluationError::EvaluationFailure(Some(info)) => {
+            format!("script error: {} (line {})", info.message, info.line_number)
+        }
+        other => format!("script error: {other:?}"),
+    }
+}
+
+fn encode_png_base64(img: &servo::RgbaImage) -> Result<String, String> {
+    let mut png = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|e| format!("png encode: {e}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png.into_inner()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn js_values_convert_to_json() {
+        let mut obj = HashMap::new();
+        obj.insert("title".to_string(), JSValue::String("Example".into()));
+        obj.insert(
+            "links".to_string(),
+            JSValue::Array(vec![JSValue::Number(1.0), JSValue::Null, JSValue::Boolean(true)]),
+        );
+        obj.insert("el".to_string(), JSValue::Element("e1".into()));
+        let v = js_value_to_json(&JSValue::Object(obj));
+        assert_eq!(v["title"], "Example");
+        assert_eq!(v["links"], serde_json::json!([1.0, null, true]));
+        assert_eq!(v["el"]["$type"], "element");
+        assert_eq!(js_value_to_json(&JSValue::Number(f64::NAN)), serde_json::Value::Null);
+    }
 }
 
 /// Unused import hush for EngineViewId in this module (kept for future mapping helpers).
