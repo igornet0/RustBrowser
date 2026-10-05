@@ -51,6 +51,9 @@ pub struct AutomationConfig {
     pub host_file: Option<PathBuf>,
     pub max_tabs: usize,
     pub max_queue: usize,
+    /// Shut down when stdin reaches EOF: a supervising parent (BoardDo) keeps the
+    /// pipe open, so the browser never outlives it, even after a crash or `kill -9`.
+    pub exit_on_stdin_eof: bool,
 }
 
 struct AppState {
@@ -74,14 +77,25 @@ pub fn run(config: AutomationConfig) -> Result<(), String> {
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
     let app = router(tx, config.token.clone());
+    let parent_gone = config.exit_on_stdin_eof.then(watch_stdin_eof);
     let served = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(config.addr)
             .await
             .map_err(|e| format!("bind {}: {e}", config.addr))?;
         info!(addr = %config.addr, "automation server listening");
         axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
+            .with_graceful_shutdown(async move {
+                match parent_gone {
+                    Some(eof) => {
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {}
+                            _ = eof => info!("stdin closed — parent process is gone"),
+                        }
+                    }
+                    None => {
+                        let _ = tokio::signal::ctrl_c().await;
+                    }
+                }
                 info!("automation server shutting down");
             })
             .await
@@ -90,6 +104,22 @@ pub fn run(config: AutomationConfig) -> Result<(), String> {
     // Router (and its Sender) is gone: the actor loop ends and shuts content down.
     let _ = actor_thread.join();
     served
+}
+
+/// Resolves once stdin hits EOF (or errors). Reads on a plain thread: stdin is blocking.
+fn watch_stdin_eof() -> oneshot::Receiver<()> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("automation-stdin".into())
+        .spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 256];
+            let mut stdin = std::io::stdin();
+            while matches!(stdin.read(&mut buf), Ok(n) if n > 0) {}
+            let _ = tx.send(());
+        })
+        .expect("spawn stdin watcher");
+    rx
 }
 
 fn spawn_actor(
@@ -313,6 +343,7 @@ mod tests {
             host_file: None,
             max_tabs: 1,
             max_queue: 1,
+            exit_on_stdin_eof: false,
         };
         assert!(run(cfg).unwrap_err().contains("--automation-token"));
     }

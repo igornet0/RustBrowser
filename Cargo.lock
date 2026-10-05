@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "browser-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "browser-automation",
  "browser-core",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "browser-automation"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "browser-core",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "browser-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "browser-ipc",
  "serde",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "browser-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "browser-core",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "browser-ipc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "browser-core",
  "serde",
@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "browser-profile"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm 0.10.3",
  "browser-core",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "browser-ui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "browser-core",
  "browser-engine",

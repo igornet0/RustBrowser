@@ -55,7 +55,9 @@ fn run_browser() -> BrowserResult<()> {
 }
 
 /// `--automation-server <addr> [--automation-token <t>] [--automation-max-tabs <n>]
-/// [--automation-data <dir>] [--content-host-file <path>]`: headless HTTP API, no window.
+/// [--automation-data <dir>] [--content-host-file <path>] [--automation-exit-on-stdin-eof]`:
+/// headless HTTP API, no window. The token may also come from
+/// `RUST_BROWSER_AUTOMATION_TOKEN` (keeps it out of `ps`).
 fn run_automation(args: &[String], addr: &str) -> Result<(), String> {
     let addr = addr
         .parse()
@@ -81,6 +83,7 @@ fn run_automation(args: &[String], addr: &str) -> Result<(), String> {
         host_file: content_host_file(args),
         max_tabs,
         max_queue: 64,
+        exit_on_stdin_eof: args.iter().any(|a| a == "--automation-exit-on-stdin-eof"),
     })
 }
 
