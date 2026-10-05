@@ -7,6 +7,8 @@ pub struct ProfilePaths {
     pub history_db: PathBuf,
     pub bookmarks_db: PathBuf,
     pub preferences: PathBuf,
+    /// Generated hosts-format file for Servo `Opts.host_file`.
+    pub local_hosts: PathBuf,
     pub session: PathBuf,
     pub downloads_db: PathBuf,
     pub passwords_db: PathBuf,
@@ -24,6 +26,7 @@ impl ProfilePaths {
             history_db: root.join("history.db"),
             bookmarks_db: root.join("bookmarks.db"),
             preferences: root.join("preferences.json"),
+            local_hosts: root.join("local_hosts"),
             session: root.join("session.json"),
             downloads_db: root.join("downloads.db"),
             passwords_db: root.join("passwords.db"),

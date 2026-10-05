@@ -35,7 +35,7 @@ pub fn is_chrome_ui_url(url: Option<&Url>) -> bool {
 }
 
 fn engine_url_for_tab(url: Option<Url>) -> Option<Url> {
-    if is_chrome_ui_url(url.as_ref()) {
+    if is_chrome_ui_url(url.as_ref()) || url.is_none() {
         Some(Url::parse("about:blank").expect("about:blank"))
     } else {
         url
@@ -95,6 +95,9 @@ pub struct BrowserController {
     pub show_import_modal: bool,
     pub show_main_menu: bool,
     pub settings_tab: SettingsTab,
+    /// Draft fields for adding a local host mapping in Network settings.
+    pub local_host_domain: String,
+    pub local_host_ip: String,
     pub import_path_buf: String,
     pub import_status: String,
     pub import_bookmarks: bool,
@@ -180,6 +183,8 @@ impl BrowserController {
             show_import_modal: false,
             show_main_menu: false,
             settings_tab: SettingsTab::General,
+            local_host_domain: String::new(),
+            local_host_ip: String::new(),
             import_path_buf: String::new(),
             import_status: String::new(),
             import_bookmarks: true,
@@ -445,8 +450,14 @@ impl BrowserController {
 
     pub fn navigate_address(&mut self, engine: &mut PageBackend) {
         let template = self.store.settings.search_engine.clone();
+        let bare_host_input = !self.address.trim().contains("://");
         match normalize_url(&self.address, &template) {
-            Ok(url) => {
+            Ok(mut url) => {
+                browser_profile::apply_local_host_overrides(
+                    &mut url,
+                    &self.store.settings.local_hosts,
+                    bare_host_input,
+                );
                 if url.as_str() == SETTINGS_URL {
                     self.open_settings(engine);
                     return;
@@ -647,9 +658,23 @@ impl BrowserController {
         // If last tab was reset, recreate engine view for new id.
         let active = self.browser.active_tab;
         let url = self.browser.active().ok().and_then(|t| t.url.clone());
-        let _ = engine.create_view(EngineViewId(active), engine_url_for_tab(url));
+        let _ = engine.create_view(EngineViewId(active), engine_url_for_tab(url.clone()));
         let _ = engine.focus_view(EngineViewId(active));
         engine.set_page_zoom(self.store.settings.default_zoom);
+        // Chrome new-tab UI: don't leave TabState::Creating (spinner) forever waiting
+        // for Servo Complete on an empty / about:blank document.
+        if is_new_tab_url(url.as_ref()) {
+            let _ = self.browser.set_loading(active, false);
+            if url.is_none() {
+                let newtab = Url::parse(NEWTAB_URL).expect("about:newtab");
+                let _ = self.browser.navigate_active(newtab.clone());
+                let _ = self.browser.set_loading(active, false);
+                let lang = self.store.settings.language;
+                let _ = self
+                    .browser
+                    .update_tab_title(active, crate::i18n::t(lang, "new_tab").to_string());
+            }
+        }
         self.sync_address_from_active();
         self.show_settings = self.settings_tab_active();
         self.schedule_session_checkpoint();

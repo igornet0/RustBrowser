@@ -15,6 +15,24 @@ pub const MAX_FRAME_BYTES: usize = 1920 * 1080 * 4 * 2; // ~16 MiB headroom (2
 pub const MAX_FRAME_WIDTH: u32 = 7680;
 pub const MAX_FRAME_HEIGHT: u32 = 4320;
 
+/// Safe pixel budget for JSON-encoded `FrameBuffer` (`Vec<u8>` → number array ≈ 3–4×).
+/// Keep raw RGBA under ~¼ of [`MAX_MESSAGE_SIZE`] so encode+send does not stall Content.
+pub const MAX_IPC_FRAME_PIXELS: u32 = (MAX_MESSAGE_SIZE / 4 / 4) as u32; // 1_048_576
+
+/// Scale `width`×`height` down uniformly so `w*h <= MAX_IPC_FRAME_PIXELS`.
+pub fn clamp_ipc_frame_size(width: u32, height: u32) -> (u32, u32) {
+    let w = width.max(1).min(MAX_FRAME_WIDTH);
+    let h = height.max(1).min(MAX_FRAME_HEIGHT);
+    let pixels = (w as u64).saturating_mul(h as u64);
+    if pixels <= u64::from(MAX_IPC_FRAME_PIXELS) {
+        return (w, h);
+    }
+    let scale = (f64::from(MAX_IPC_FRAME_PIXELS) / pixels as f64).sqrt();
+    let nw = ((f64::from(w) * scale).floor() as u32).max(1);
+    let nh = ((f64::from(h) * scale).floor() as u32).max(1);
+    (nw, nh)
+}
+
 pub const MAX_URL_LENGTH: usize = 8 * 1024;
 pub const MAX_STRING_LENGTH: usize = 16 * 1024;
 pub const MAX_TITLE_LENGTH: usize = 2 * 1024;
@@ -322,6 +340,23 @@ mod tests {
     fn accepts_placeholder_empty_rgba() {
         let frame = FrameBuffer::placeholder(100, 100);
         assert!(validate_frame(&frame).is_ok());
+    }
+
+    #[test]
+    fn clamp_ipc_frame_keeps_small_sizes() {
+        assert_eq!(clamp_ipc_frame_size(1280, 720), (1280, 720));
+    }
+
+    #[test]
+    fn clamp_ipc_frame_caps_retina() {
+        let (w, h) = clamp_ipc_frame_size(3024, 1800);
+        assert!(u64::from(w) * u64::from(h) <= u64::from(MAX_IPC_FRAME_PIXELS));
+        assert!(w < 3024);
+        assert!(h < 1800);
+        // Aspect roughly preserved.
+        let aspect_in = 3024.0 / 1800.0;
+        let aspect_out = f64::from(w) / f64::from(h);
+        assert!((aspect_in - aspect_out).abs() < 0.05);
     }
 
     #[test]

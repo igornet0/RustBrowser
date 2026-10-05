@@ -8,8 +8,9 @@ use crate::identity::build_preferences;
 use browser_core::{BrowserError, BrowserResult, TabId};
 use crate::ipc_keymap::{self, parse_ipc_key};
 use browser_ipc::{
-    connect_unix, validate_browser_to_content, BrowserToContent, ContentToBrowser, Envelope,
-    FrameBuffer, InputEventMsg, IpcReader, IpcWriter, NetworkRouteMsg, PROTOCOL_VERSION,
+    clamp_ipc_frame_size, connect_unix, validate_browser_to_content, BrowserToContent,
+    ContentToBrowser, Envelope, FrameBuffer, InputEventMsg, IpcReader, IpcWriter, NetworkRouteMsg,
+    PROTOCOL_VERSION,
 };
 use euclid::Scale;
 use servo::{
@@ -131,7 +132,7 @@ struct ContentRuntime {
 }
 
 impl ContentRuntime {
-    fn new(storage: Option<PathBuf>) -> BrowserResult<Self> {
+    fn new(storage: Option<PathBuf>, host_file: Option<PathBuf>) -> BrowserResult<Self> {
         let page_size = PhysicalSize::new(1280, 720);
         let context = Rc::new(
             SoftwareRenderingContext::new(page_size)
@@ -143,6 +144,17 @@ impl ContentRuntime {
         if let Some(dir) = storage {
             let _ = std::fs::create_dir_all(&dir);
             opts.config_dir = Some(dir);
+        }
+        if let Some(path) = host_file {
+            if path.is_file() {
+                info!(path = %path.display(), "content process host_file enabled");
+                opts.host_file = Some(path);
+            } else {
+                warn!(
+                    path = %path.display(),
+                    "content host_file missing — using system DNS"
+                );
+            }
         }
 
         let wake = Arc::new(AtomicBool::new(false));
@@ -286,7 +298,18 @@ impl ContentRuntime {
     }
 
     fn resize(&mut self, width: u32, height: u32, scale: f64) {
-        let size = PhysicalSize::new(width.max(1).min(8192), height.max(1).min(8192));
+        // Cap framebuffer so JSON IPC frames stay under MAX_MESSAGE_SIZE.
+        // Retina fullscreen (~3k×2k) otherwise stalls Content on serde encode and
+        // LoadStatus never reaches the Browser — spinner hangs forever.
+        let (w, h) = clamp_ipc_frame_size(width.max(1).min(8192), height.max(1).min(8192));
+        if w != width || h != height {
+            warn!(
+                requested = %format!("{width}x{height}"),
+                capped = %format!("{w}x{h}"),
+                "content framebuffer capped for IPC"
+            );
+        }
+        let size = PhysicalSize::new(w, h);
         self.scale = if scale.is_finite() && scale > 0.0 {
             scale
         } else {
@@ -424,8 +447,12 @@ impl ContentRuntime {
     }
 }
 
-/// Entry point for `--content-process <socket> --content-storage <dir>`.
-pub fn run_content_process(socket: &Path, storage: Option<PathBuf>) -> BrowserResult<()> {
+/// Entry point for `--content-process <socket> --content-storage <dir> [--content-host-file <path>]`.
+pub fn run_content_process(
+    socket: &Path,
+    storage: Option<PathBuf>,
+    host_file: Option<PathBuf>,
+) -> BrowserResult<()> {
     info!(
         pid = std::process::id(),
         socket = %socket.display(),
@@ -450,7 +477,7 @@ pub fn run_content_process(socket: &Path, storage: Option<PathBuf>) -> BrowserRe
     let mut writer = IpcWriter::new(stream.try_clone().map_err(|e| BrowserError::engine(e.to_string()))?);
     let mut reader = IpcReader::new(stream);
 
-    let mut runtime = ContentRuntime::new(storage)?;
+    let mut runtime = ContentRuntime::new(storage, host_file)?;
     let mut next_id = 1u64;
 
     // Wait for Hello
@@ -596,14 +623,31 @@ pub fn run_content_process(socket: &Path, storage: Option<PathBuf>) -> BrowserRe
                     }
                     BrowserToContent::RequestFrame { tab_id } => {
                         if let Some(frame) = runtime.capture_frame(tab_id) {
-                            let seq = out_seq;
-                            out_seq += 1;
-                            let _ = send_out(
-                                &mut writer,
-                                rid,
-                                seq,
-                                ContentToBrowser::Frame { tab_id, frame },
-                            );
+                            let raw = frame.byte_len();
+                            // Avoid serde_json encode of oversized RGBA (stalls Content on Retina).
+                            if raw.saturating_mul(4) > browser_ipc::MAX_MESSAGE_SIZE {
+                                warn!(
+                                    raw,
+                                    "skip RequestFrame — would exceed IPC JSON budget"
+                                );
+                            } else {
+                                let seq = out_seq;
+                                out_seq += 1;
+                                match send_out(
+                                    &mut writer,
+                                    rid,
+                                    seq,
+                                    ContentToBrowser::Frame { tab_id, frame },
+                                ) {
+                                    Ok(()) => {}
+                                    Err(browser_ipc::IpcError::TooLarge(n)) => {
+                                        warn!(n, "skip oversized frame");
+                                    }
+                                    Err(_) => {
+                                        running = false;
+                                    }
+                                }
+                            }
                         }
                     }
                     BrowserToContent::SetNetworkRoute { mode } => {
@@ -660,19 +704,39 @@ pub fn run_content_process(socket: &Path, storage: Option<PathBuf>) -> BrowserRe
         if dirty && runtime.last_frame.elapsed() > Duration::from_millis(100) {
             if let Some(tab_id) = runtime.focused {
                 if let Some(frame) = runtime.capture_frame(tab_id) {
-                    next_id += 1;
-                    let seq = out_seq;
-                    out_seq += 1;
-                    let _ = send_out(
-                        &mut writer,
-                        next_id,
-                        seq,
-                        ContentToBrowser::Frame { tab_id, frame },
-                    );
-                    if let Ok(mut d) = runtime.shared.dirty.lock() {
-                        *d = false;
+                    let raw = frame.byte_len();
+                    if raw.saturating_mul(4) > browser_ipc::MAX_MESSAGE_SIZE {
+                        warn!(raw, "skip dirty frame — would exceed IPC JSON budget");
+                        if let Ok(mut d) = runtime.shared.dirty.lock() {
+                            *d = false;
+                        }
+                    } else {
+                        next_id += 1;
+                        let seq = out_seq;
+                        out_seq += 1;
+                        match send_out(
+                            &mut writer,
+                            next_id,
+                            seq,
+                            ContentToBrowser::Frame { tab_id, frame },
+                        ) {
+                            Ok(()) => {
+                                if let Ok(mut d) = runtime.shared.dirty.lock() {
+                                    *d = false;
+                                }
+                                runtime.last_frame = Instant::now();
+                            }
+                            Err(browser_ipc::IpcError::TooLarge(n)) => {
+                                warn!(n, "skip oversized dirty frame");
+                                if let Ok(mut d) = runtime.shared.dirty.lock() {
+                                    *d = false;
+                                }
+                            }
+                            Err(_) => {
+                                running = false;
+                            }
+                        }
                     }
-                    runtime.last_frame = Instant::now();
                 }
             }
         }

@@ -6,7 +6,7 @@ use crate::i18n;
 use crate::theme::{self, radius, space};
 use crate::widgets;
 use crate::page_backend::PageBackend;
-use browser_profile::{ColorScheme, StartupBehavior, Theme, UiLanguage};
+use browser_profile::{ColorScheme, LocalHostEntry, StartupBehavior, Theme, UiLanguage};
 use egui::{Align2, CornerRadius, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, Vec2};
 
 const SIDEBAR_W: f32 = 220.0;
@@ -431,9 +431,113 @@ fn draw_privacy(ui: &mut egui::Ui, controller: &mut BrowserController) {
     }
 }
 
-fn draw_network(ui: &mut egui::Ui, _controller: &mut BrowserController) {
+fn draw_network(ui: &mut egui::Ui, controller: &mut BrowserController) {
+    let lang = controller.store.settings.language;
     let t = theme::current();
-    ui.label(RichText::new("Proxy and network controls coming soon.").color(t.text_secondary));
+
+    widgets::caption(ui, i18n::t(lang, "local_hosts"));
+    ui.add_space(space::SM);
+    ui.label(
+        RichText::new(i18n::t(lang, "local_hosts_help"))
+            .size(12.0)
+            .color(t.text_secondary),
+    );
+    ui.add_space(space::MD);
+
+    let mut remove_at: Option<usize> = None;
+    let entries: Vec<_> = controller.store.settings.local_hosts.clone();
+    if entries.is_empty() {
+        ui.label(
+            RichText::new(i18n::t(lang, "local_hosts_empty"))
+                .size(12.0)
+                .color(t.text_tertiary),
+        );
+    } else {
+        for (idx, entry) in entries.iter().enumerate() {
+            ui.push_id(("local_host_row", idx), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{} → {}", entry.domain, entry.target_display()))
+                            .size(13.0)
+                            .color(t.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if widgets::ghost_button(ui, i18n::t(lang, "local_hosts_remove")).clicked()
+                        {
+                            remove_at = Some(idx);
+                        }
+                    });
+                });
+            });
+            ui.add_space(space::SM);
+        }
+    }
+    if let Some(idx) = remove_at {
+        if idx < controller.store.settings.local_hosts.len() {
+            controller.store.settings.local_hosts.remove(idx);
+        }
+    }
+
+    ui.add_space(space::LG);
+    widgets::caption(ui, i18n::t(lang, "local_hosts_add"));
+    ui.add_space(space::SM);
+    ui.horizontal(|ui| {
+        ui.set_width(ui.available_width().min(560.0));
+        ui.vertical(|ui| {
+            ui.label(RichText::new(i18n::t(lang, "local_hosts_domain")).size(12.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut controller.local_host_domain)
+                    .hint_text("app.local")
+                    .desired_width(260.0),
+            );
+        });
+        ui.add_space(space::MD);
+        ui.vertical(|ui| {
+            ui.label(RichText::new(i18n::t(lang, "local_hosts_ip")).size(12.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut controller.local_host_ip)
+                    .hint_text("192.168.1.10:3000")
+                    .desired_width(180.0),
+            );
+        });
+    });
+    ui.add_space(space::SM);
+    if widgets::ghost_button(ui, i18n::t(lang, "local_hosts_add_btn")).clicked() {
+        match LocalHostEntry::from_target(
+            controller.local_host_domain.clone(),
+            &controller.local_host_ip,
+        ) {
+            Ok(entry) => {
+                if let Some(existing) = controller
+                    .store
+                    .settings
+                    .local_hosts
+                    .iter_mut()
+                    .find(|e| e.domain.eq_ignore_ascii_case(&entry.domain))
+                {
+                    *existing = entry;
+                } else {
+                    controller.store.settings.local_hosts.push(entry);
+                }
+                controller.local_host_domain.clear();
+                controller.local_host_ip.clear();
+            }
+            Err(reason) => {
+                controller.push_status(reason);
+            }
+        }
+    }
+
+    ui.add_space(space::XL);
+    if widgets::primary_button(ui, i18n::t(lang, "save")).clicked() {
+        let lang = controller.store.settings.language;
+        theme::invalidate_applied();
+        if let Err(err) = controller.store.save_settings() {
+            controller.push_status(err.to_string());
+        } else {
+            controller.push_status(i18n::t(lang, "local_hosts_restart").to_string());
+        }
+    }
 }
 
 fn draw_vpn(ui: &mut egui::Ui, controller: &mut BrowserController) {

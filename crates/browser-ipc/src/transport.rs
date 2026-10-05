@@ -30,6 +30,16 @@ pub enum IpcError {
 }
 
 pub fn listen_unix(path: &Path) -> Result<UnixListener, IpcError> {
+    // Darwin `sockaddr_un.sun_path` is 104 bytes (incl. NUL). Fail early with context.
+    const MAX_UNIX_PATH: usize = 103;
+    let path_bytes = path.as_os_str().as_encoded_bytes();
+    if path_bytes.len() > MAX_UNIX_PATH {
+        return Err(IpcError::Validation(format!(
+            "unix socket path too long ({} > {MAX_UNIX_PATH}): {}",
+            path_bytes.len(),
+            path.display()
+        )));
+    }
     if path.exists() {
         let _ = std::fs::remove_file(path);
     }

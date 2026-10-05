@@ -7,7 +7,7 @@ use browser_core::{BrowserError, BrowserResult, TabId};
 use browser_engine::{
     BrowserEngine, EngineEvent, EngineViewId, ServoEngine, ServoEngineConfig, UiSurface,
 };
-use browser_ipc::{ContentToBrowser, FrameBuffer, InputEventMsg};
+use browser_ipc::{clamp_ipc_frame_size, ContentToBrowser, FrameBuffer, InputEventMsg};
 use browser_core::Route;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,6 +29,9 @@ pub enum PageBackend {
         focused: Option<TabId>,
         content_origin_x: f64,
         content_origin_y: f64,
+        /// Full content viewport in window pixels (hit-testing / layout sync).
+        requested_size: PhysicalSize<u32>,
+        /// Servo/IPC framebuffer (may be capped under [`clamp_ipc_frame_size`]).
         page_size: PhysicalSize<u32>,
         scale: f64,
         last_mouse: PhysicalPosition<f64>,
@@ -48,14 +51,21 @@ impl PageBackend {
         content_dir: PathBuf,
         socket_dir: PathBuf,
         exe: PathBuf,
+        host_file: Option<PathBuf>,
     ) -> BrowserResult<Self> {
         let surface = UiSurface::new(display_handle, window_handle, window_size)?;
-        let remote = RemoteContentSession::start(content_dir, socket_dir, exe)?;
+        let remote =
+            RemoteContentSession::start_with_host_file(content_dir, socket_dir, exe, host_file)?;
         info!(
             pid = ?remote.content_pid(),
             "P1.1 isolated content process attached — Browser owns no Servo"
         );
         let toolbar = (96.0_f64).max(1.0);
+        let requested = PhysicalSize::new(
+            window_size.width.max(1),
+            window_size.height.saturating_sub(toolbar as u32).max(1),
+        );
+        let (cw, ch) = clamp_ipc_frame_size(requested.width, requested.height);
         Ok(Self::Isolated {
             surface,
             remote,
@@ -64,10 +74,8 @@ impl PageBackend {
             focused: None,
             content_origin_x: 0.0,
             content_origin_y: toolbar,
-            page_size: PhysicalSize::new(
-                window_size.width.max(1),
-                window_size.height.saturating_sub(toolbar as u32).max(1),
-            ),
+            requested_size: requested,
+            page_size: PhysicalSize::new(cw, ch),
             scale: 1.0,
             last_mouse: PhysicalPosition::new(0.0, 0.0),
             modifiers: ModifiersState::default(),
@@ -181,10 +189,13 @@ impl PageBackend {
                 scale: s,
                 remote,
                 page_size,
+                requested_size,
                 ..
             } => {
                 *s = scale;
-                let _ = remote.resize(page_size.width, page_size.height, scale);
+                let (w, h) = clamp_ipc_frame_size(requested_size.width, requested_size.height);
+                *page_size = PhysicalSize::new(w, h);
+                let _ = remote.resize(w, h, scale);
             }
             Self::Legacy(engine) => engine.set_scale_factor(scale),
         }
@@ -216,7 +227,8 @@ impl PageBackend {
 
     pub fn page_size(&self) -> PhysicalSize<u32> {
         match self {
-            Self::Isolated { page_size, .. } => *page_size,
+            // Layout sync compares against the full viewport, not the capped framebuffer.
+            Self::Isolated { requested_size, .. } => *requested_size,
             Self::Legacy(engine) => engine.page_size(),
         }
     }
@@ -228,10 +240,11 @@ impl PageBackend {
         rect: egui::Rect,
         tab: TabId,
     ) {
-        let Self::Isolated { frames, remote, .. } = self else {
+        let Self::Isolated { frames, .. } = self else {
             return;
         };
-        let _ = remote.request_frame(tab);
+        // Do not request_frame every egui paint — Content pushes dirty frames on its own.
+        // Spamming RequestFrame on Retina stalls Content on JSON encode and freezes loads.
         if let Some(frame) = frames.get(&tab) {
             if frame.rgba.len()
                 == (frame.width as usize).saturating_mul(frame.height as usize).saturating_mul(4)
@@ -401,12 +414,15 @@ impl PageBackend {
         match self {
             Self::Isolated {
                 remote,
+                requested_size,
                 page_size,
                 scale,
                 ..
             } => {
-                *page_size = size;
-                remote.resize(size.width, size.height, *scale)
+                *requested_size = size;
+                let (w, h) = clamp_ipc_frame_size(size.width.max(1), size.height.max(1));
+                *page_size = PhysicalSize::new(w, h);
+                remote.resize(w, h, *scale)
             }
             Self::Legacy(engine) => engine.resize(size),
         }
@@ -414,14 +430,8 @@ impl PageBackend {
 
     pub fn paint_webview(&mut self) -> BrowserResult<()> {
         match self {
-            Self::Isolated {
-                remote, focused, ..
-            } => {
-                if let Some(tab) = *focused {
-                    let _ = remote.request_frame(tab);
-                }
-                Ok(())
-            }
+            // Isolated frames are pushed by Content when dirty — no per-paint RequestFrame.
+            Self::Isolated { .. } => Ok(()),
             Self::Legacy(engine) => engine.paint_webview(),
         }
     }
@@ -497,7 +507,7 @@ impl PageBackend {
                                         reason,
                                     });
                                 }
-                                ContentToBrowser::Error { message, .. } => {
+                                ContentToBrowser::Error { tab_id, message } => {
                                     if message.contains("restarted")
                                         || message.contains("died")
                                         || message.contains("hang")
@@ -505,6 +515,13 @@ impl PageBackend {
                                         *needs_tab_restore = true;
                                     }
                                     warn!(%message, "content process message");
+                                    // Failed navigate / unknown tab must not leave the spinner spinning.
+                                    if let Some(tab_id) = tab_id {
+                                        events.push(EngineEvent::LoadStatusChanged {
+                                            view: EngineViewId(tab_id),
+                                            loading: false,
+                                        });
+                                    }
                                 }
                                 ContentToBrowser::NavigationFinished { tab_id, url } => {
                                     events.push(EngineEvent::UrlChanged {
@@ -544,6 +561,7 @@ impl PageBackend {
                 content_origin_x,
                 content_origin_y: origin_y,
                 last_mouse,
+                requested_size,
                 page_size,
                 modifiers,
                 ..
@@ -556,16 +574,18 @@ impl PageBackend {
                 let Some(tab_id) = *focused else {
                     return;
                 };
+                let hit_w = requested_size.width.max(1) as f64;
+                let hit_h = requested_size.height.max(1) as f64;
+                let page_w = page_size.width.max(1) as f64;
+                let page_h = page_size.height.max(1) as f64;
                 let in_page = |pos: PhysicalPosition<f64>| -> Option<(f64, f64)> {
                     let x = pos.x - *content_origin_x;
                     let y = pos.y - *origin_y;
-                    if x < 0.0 || y < 0.0 {
+                    if x < 0.0 || y < 0.0 || x > hit_w || y > hit_h {
                         return None;
                     }
-                    if x > page_size.width as f64 || y > page_size.height as f64 {
-                        return None;
-                    }
-                    Some((x, y))
+                    // Map viewport coords → capped Servo framebuffer.
+                    Some((x * page_w / hit_w, y * page_h / hit_h))
                 };
                 let mods_byte = {
                     let mut m = 0u8;

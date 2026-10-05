@@ -38,6 +38,8 @@ pub struct ServoEngineConfig<'a> {
     pub event_loop_waker: Box<dyn servo::EventLoopWaker>,
     /// Servo engine storage (cookies / site data). Prefer the active profile `storage/` dir.
     pub config_dir: Option<std::path::PathBuf>,
+    /// Optional hosts-format file for domain → IP overrides (`Opts.host_file`).
+    pub host_file: Option<std::path::PathBuf>,
     /// BCP-47 locale for `Accept-Language` (e.g. `ru-RU`). Empty / None → system locale.
     pub locale: Option<String>,
 }
@@ -129,6 +131,17 @@ impl ServoEngine {
                 warn!(?err, "could not create servo config dir");
             } else {
                 opts.config_dir = Some(dir);
+            }
+        }
+        if let Some(host_file) = config.host_file {
+            if host_file.is_file() {
+                info!(path = %host_file.display(), "servo host_file enabled");
+                opts.host_file = Some(host_file);
+            } else {
+                warn!(
+                    path = %host_file.display(),
+                    "host_file path set but file missing — using system DNS"
+                );
             }
         }
 

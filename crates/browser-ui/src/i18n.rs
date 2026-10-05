@@ -115,6 +115,15 @@ fn en(key: &str) -> &'static str {
         "history_cleared" => "History cleared",
         "open_downloads" => "Open downloads",
         "library_hint" => "Browse your library from dedicated panels.",
+        "local_hosts" => "Local domains",
+        "local_hosts_help" => "Map a domain to a local IP or IP:port (e.g. 192.168.0.1:3000). The address bar keeps the domain; connections use the IP. Restart after saving.",
+        "local_hosts_empty" => "No local domains yet.",
+        "local_hosts_add" => "Add mapping",
+        "local_hosts_domain" => "Domain",
+        "local_hosts_ip" => "IP or IP:port",
+        "local_hosts_add_btn" => "Add",
+        "local_hosts_remove" => "Remove",
+        "local_hosts_restart" => "Local domains saved — restart the browser to apply",
         _ => "???",
     }
 }
@@ -187,6 +196,16 @@ fn ru(key: &str) -> &'static str {
         "recent_tabs_empty" => "Здесь появятся закрытые вкладки",
         "bookmarks_empty" => "Закладок пока нет — нажмите ★ на странице",
         "new_tab_subtitle" => "Поиск или введите адрес",
+        "network" => "Сеть",
+        "local_hosts" => "Локальные домены",
+        "local_hosts_help" => "Сопоставьте домен с локальным IP или IP:порт (например 192.168.0.1:3000). В адресной строке останется домен, соединение пойдёт на IP. После сохранения перезапустите браузер.",
+        "local_hosts_empty" => "Локальных доменов пока нет.",
+        "local_hosts_add" => "Добавить запись",
+        "local_hosts_domain" => "Домен",
+        "local_hosts_ip" => "IP или IP:порт",
+        "local_hosts_add_btn" => "Добавить",
+        "local_hosts_remove" => "Удалить",
+        "local_hosts_restart" => "Локальные домены сохранены — перезапустите браузер",
         _ => en(key),
     }
 }

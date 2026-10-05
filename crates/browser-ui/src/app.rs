@@ -119,7 +119,10 @@ impl ApplicationHandler<WakerEvent> for App {
         let mut engine = if browser_core::content_isolation_enabled() {
             let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rust-browser"));
             let content_dir = controller.store.paths.root.join("content");
-            let socket_dir = controller.store.paths.cache.join("ipc");
+            // Unix domain sockets have a ~104-byte path limit on macOS; profile
+            // paths under Application Support are too long — use /tmp instead.
+            let socket_dir = short_ipc_socket_dir();
+            let host_file = host_file_for_engine(&controller);
             match PageBackend::start_isolated(
                 display_handle,
                 window_handle,
@@ -127,6 +130,7 @@ impl ApplicationHandler<WakerEvent> for App {
                 content_dir,
                 socket_dir,
                 exe,
+                host_file,
             ) {
                 Ok(backend) => backend,
                 Err(err) => {
@@ -146,6 +150,7 @@ impl ApplicationHandler<WakerEvent> for App {
                 scale_factor: scale,
                 event_loop_waker: Box::new(waker.clone()),
                 config_dir: Some(controller.store.paths.storage.clone()),
+                host_file: host_file_for_engine(&controller),
                 locale: Some(controller.store.settings.language.locale_tag().to_string()),
             }) {
                 Ok(b) => b,
@@ -478,6 +483,22 @@ impl ApplicationHandler<WakerEvent> for App {
                 }
             }
         }
+    }
+}
+
+/// Short AF_UNIX socket directory. Profile cache paths under
+/// `~/Library/Application Support/...` exceed macOS `sun_path` (~104 bytes).
+fn short_ipc_socket_dir() -> PathBuf {
+    PathBuf::from("/tmp").join(format!("rb-ipc-{}", std::process::id()))
+}
+
+/// Path to the profile hosts file when it exists (Servo domain → IP overrides).
+fn host_file_for_engine(controller: &BrowserController) -> Option<PathBuf> {
+    let path = controller.store.paths.local_hosts.clone();
+    if path.is_file() {
+        Some(path)
+    } else {
+        None
     }
 }
 

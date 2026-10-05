@@ -138,6 +138,8 @@ pub struct ContentProcessManager {
     pub content_dir: PathBuf,
     pub socket_dir: PathBuf,
     pub exe: PathBuf,
+    /// Optional Servo hosts-format file passed to content as `--content-host-file`.
+    pub host_file: Option<PathBuf>,
     next_request_id: u64,
     next_generation: u64,
     /// When true, scheduled restarts must not spawn.
@@ -146,6 +148,15 @@ pub struct ContentProcessManager {
 
 impl ContentProcessManager {
     pub fn new(content_dir: PathBuf, socket_dir: PathBuf, exe: PathBuf) -> BrowserResult<Self> {
+        Self::with_host_file(content_dir, socket_dir, exe, None)
+    }
+
+    pub fn with_host_file(
+        content_dir: PathBuf,
+        socket_dir: PathBuf,
+        exe: PathBuf,
+        host_file: Option<PathBuf>,
+    ) -> BrowserResult<Self> {
         std::fs::create_dir_all(&content_dir).map_err(|e| BrowserError::Other(e.to_string()))?;
         std::fs::create_dir_all(&socket_dir).map_err(|e| BrowserError::Other(e.to_string()))?;
         Ok(Self {
@@ -157,6 +168,7 @@ impl ContentProcessManager {
             content_dir,
             socket_dir,
             exe,
+            host_file,
             next_request_id: 1,
             next_generation: 1,
             shutting_down: false,
@@ -208,8 +220,13 @@ impl ContentProcessManager {
         cmd.arg("--content-process")
             .arg(&socket)
             .arg("--content-storage")
-            .arg(&child_storage)
-            .stdin(Stdio::null())
+            .arg(&child_storage);
+        if let Some(host_file) = &self.host_file {
+            if host_file.is_file() {
+                cmd.arg("--content-host-file").arg(host_file);
+            }
+        }
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .env_clear()

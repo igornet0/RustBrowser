@@ -27,5 +27,8 @@ pub use paths::ProfilePaths;
 pub use permissions::{PermissionDecision, PermissionKind, PermissionManager, PermissionRecord};
 pub use profile::{BrowserProfile, ProfileId, ProfileManager};
 pub use session::{atomic_write_json, SessionState, SessionStore, SessionTab, WindowState};
-pub use settings::{ColorScheme, NetworkMode, Settings, StartupBehavior, Theme, UiLanguage};
+pub use settings::{
+    apply_local_host_overrides, format_hosts_file, sync_local_hosts_file, ColorScheme,
+    LocalHostEntry, NetworkMode, Settings, StartupBehavior, Theme, UiLanguage,
+};
 pub use store::ProfileStore;

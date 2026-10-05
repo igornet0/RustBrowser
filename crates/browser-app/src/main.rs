@@ -21,8 +21,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(socket) = content_process_socket(&args) {
         let storage = content_storage(&args);
-        tracing::info!(?socket, ?storage, "content process entry");
-        if let Err(err) = run_content_process(&socket, storage) {
+        let host_file = content_host_file(&args);
+        tracing::info!(?socket, ?storage, ?host_file, "content process entry");
+        if let Err(err) = run_content_process(&socket, storage, host_file) {
             tracing::error!(error = %err, "content process exited with error");
             std::process::exit(1);
         }
@@ -53,6 +54,16 @@ fn content_process_socket(args: &[String]) -> Option<PathBuf> {
 fn content_storage(args: &[String]) -> Option<PathBuf> {
     args.windows(2).find_map(|w| {
         if w[0] == "--content-storage" {
+            Some(PathBuf::from(&w[1]))
+        } else {
+            None
+        }
+    })
+}
+
+fn content_host_file(args: &[String]) -> Option<PathBuf> {
+    args.windows(2).find_map(|w| {
+        if w[0] == "--content-host-file" {
             Some(PathBuf::from(&w[1]))
         } else {
             None

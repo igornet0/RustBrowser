@@ -14,8 +14,9 @@ pub use protocol::{
 pub use transport::{connect_unix, listen_unix, IpcError, IpcReader, IpcWriter};
 pub use validate::{
     checked_frame_bytes, validate_browser_to_content, validate_content_to_browser,
-    validate_envelope_meta, validate_frame, InboundOrder, ValidationError, MAX_FRAME_BYTES,
-    MAX_FRAME_HEIGHT, MAX_FRAME_WIDTH, MAX_MESSAGE_SIZE, MAX_STRING_LENGTH, MAX_URL_LENGTH,
+    clamp_ipc_frame_size, validate_envelope_meta, validate_frame, InboundOrder, ValidationError,
+    MAX_FRAME_BYTES, MAX_FRAME_HEIGHT, MAX_FRAME_WIDTH, MAX_IPC_FRAME_PIXELS, MAX_MESSAGE_SIZE,
+    MAX_STRING_LENGTH, MAX_URL_LENGTH,
 };
 
 #[cfg(test)]

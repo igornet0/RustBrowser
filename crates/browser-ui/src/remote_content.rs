@@ -34,7 +34,17 @@ pub struct RemoteContentSession {
 
 impl RemoteContentSession {
     pub fn start(content_dir: PathBuf, socket_dir: PathBuf, exe: PathBuf) -> BrowserResult<Self> {
-        let mut manager = ContentProcessManager::new(content_dir, socket_dir, exe)?;
+        Self::start_with_host_file(content_dir, socket_dir, exe, None)
+    }
+
+    pub fn start_with_host_file(
+        content_dir: PathBuf,
+        socket_dir: PathBuf,
+        exe: PathBuf,
+        host_file: Option<PathBuf>,
+    ) -> BrowserResult<Self> {
+        let mut manager =
+            ContentProcessManager::with_host_file(content_dir, socket_dir, exe, host_file)?;
         let process_id = ContentProcessId::new();
         let path = manager.socket_for(process_id);
         let listener = listen_unix(&path).map_err(|e| BrowserError::Other(e.to_string()))?;

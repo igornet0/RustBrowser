@@ -5,9 +5,9 @@ use crate::passwords::CredentialStore;
 use crate::paths::ProfilePaths;
 use crate::permissions::PermissionManager;
 use crate::session::SessionStore;
-use crate::settings::Settings;
+use crate::settings::{sync_local_hosts_file, Settings};
 use browser_core::{BrowserError, BrowserResult};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Open stores for a single profile directory.
 pub struct ProfileStore {
@@ -33,6 +33,9 @@ impl ProfileStore {
         let credentials = CredentialStore::open(&paths.passwords_db)?;
         let permissions = PermissionManager::open(&paths.permissions_db)?;
         let settings = Settings::load_or_default(&paths.preferences)?;
+        if let Err(err) = sync_local_hosts_file(&paths.local_hosts, &settings.local_hosts) {
+            warn!(?err, "could not sync local hosts file on profile open");
+        }
         let session = SessionStore::new(paths.session.clone());
         let downloads = DownloadManager::open(&paths.downloads_db, paths.downloads_dir.clone())?;
 
@@ -49,6 +52,8 @@ impl ProfileStore {
     }
 
     pub fn save_settings(&self) -> BrowserResult<()> {
-        self.settings.save(&self.paths.preferences)
+        self.settings.save(&self.paths.preferences)?;
+        sync_local_hosts_file(&self.paths.local_hosts, &self.settings.local_hosts)?;
+        Ok(())
     }
 }
