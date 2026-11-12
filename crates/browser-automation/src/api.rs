@@ -66,6 +66,13 @@ impl WaitCondition {
             && self.js.is_none()
             && self.network_idle_ms.is_none()
     }
+
+    /// Selector/text/JS can be checked while the page is still loading: many sites
+    /// never fire `load` (endless analytics requests). Network idle is only meaningful
+    /// after it.
+    pub fn checkable_during_load(&self) -> bool {
+        !self.is_empty() && self.network_idle_ms.is_none()
+    }
 }
 
 /// A request that passed validation.
@@ -231,7 +238,8 @@ pub fn wait_probe_script(cond: &WaitCondition) -> String {
         ));
     }
     format!(
-        "(() => {{ try {{ {} return true; }} catch (e) {{ return false; }} }})()",
+        // The probe may run before the navigation commits; never match the blank page.
+        "(() => {{ try {{ if (location.href === 'about:blank') return false; {} return true; }} catch (e) {{ return false; }} }})()",
         checks.join(" ")
     )
 }

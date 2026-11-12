@@ -15,6 +15,7 @@ browser-core = { workspace = true }
 browser-engine = { workspace = true }
 browser-automation = { workspace = true }
 browser-ui = { workspace = true }
+url = { workspace = true }
 rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

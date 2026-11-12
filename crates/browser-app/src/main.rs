@@ -44,14 +44,27 @@ fn main() {
     }
 
     tracing::info!("browser process startup");
-    if let Err(err) = run_browser() {
+    if let Err(err) = run_browser(&args) {
         tracing::error!(error = %err, "browser exited with error");
         std::process::exit(1);
     }
 }
 
-fn run_browser() -> BrowserResult<()> {
-    browser_ui::run()
+/// Desktop UI. `--open <url>` opens that page in a new tab; `--content-dir <dir>` uses
+/// `dir` for cookies/site storage (pass an automation server's `<data>/content` to share
+/// its session, e.g. to solve a captcha by hand — not while that server is running).
+fn run_browser(args: &[String]) -> BrowserResult<()> {
+    let open_url = arg_value(args, "--open").and_then(|u| match url::Url::parse(&u) {
+        Ok(url) => Some(url),
+        Err(err) => {
+            tracing::warn!(url = %u, error = %err, "ignoring invalid --open url");
+            None
+        }
+    });
+    browser_ui::run_with(browser_ui::LaunchOptions {
+        open_url,
+        content_dir: arg_value(args, "--content-dir").map(PathBuf::from),
+    })
 }
 
 /// `--automation-server <addr> [--automation-token <t>] [--automation-max-tabs <n>]

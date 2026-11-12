@@ -911,6 +911,7 @@ dependencies = [
  "rustls",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

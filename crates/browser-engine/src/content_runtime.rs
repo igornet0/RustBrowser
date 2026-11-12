@@ -232,15 +232,22 @@ impl ContentRuntime {
             screenshot_pending: RefCell::new(Default::default()),
             network: RefCell::new(HashMap::new()),
         });
-        // Automation pages get the fetch/XHR recorder before their own scripts run.
-        let user_content = options.automation.then(|| {
+        // Every page gets shims for Web APIs Servo lacks; automation pages also get
+        // the fetch/XHR recorder. Both run before the page's own scripts.
+        let user_content = {
             let manager = Rc::new(UserContentManager::new(&servo));
             manager.add_script(Rc::new(UserScript::new(
-                include_str!("network_hook.js").to_string(),
+                include_str!("compat_shims.js").to_string(),
                 None,
             )));
-            manager
-        });
+            if options.automation {
+                manager.add_script(Rc::new(UserScript::new(
+                    include_str!("network_hook.js").to_string(),
+                    None,
+                )));
+            }
+            Some(manager)
+        };
 
         Ok(Self {
             servo,

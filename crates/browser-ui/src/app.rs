@@ -39,21 +39,41 @@ struct Running {
     last_checkpoint: Instant,
 }
 
+/// Startup overrides for the desktop UI (`rust-browser --open <url> --content-dir <dir>`).
+#[derive(Debug, Default, Clone)]
+pub struct LaunchOptions {
+    /// Open this URL in a new active tab instead of the homepage / restore prompt.
+    pub open_url: Option<url::Url>,
+    /// Use this directory for page storage (cookies, localStorage) instead of the
+    /// profile's own, e.g. an automation server's `<data>/content` so a captcha solved
+    /// here is remembered by the headless browser.
+    pub content_dir: Option<PathBuf>,
+}
+
 enum App {
     Boot {
         waker: Waker,
         controller: Option<BrowserController>,
+        content_dir: Option<PathBuf>,
     },
     Running(Box<Running>),
 }
 
 /// Launch the desktop browser UI.
 pub fn run() -> browser_core::BrowserResult<()> {
+    run_with(LaunchOptions::default())
+}
+
+/// Launch the desktop browser UI with [`LaunchOptions`].
+pub fn run_with(options: LaunchOptions) -> browser_core::BrowserResult<()> {
     let oop = browser_core::content_isolation_enabled();
     info!(content_isolation = oop, "browser startup");
 
     let profiles_root = ProfileManager::default_root();
-    let controller = BrowserController::bootstrap(profiles_root)?;
+    let mut controller = BrowserController::bootstrap(profiles_root)?;
+    if let Some(url) = options.open_url {
+        controller.open_startup_url(url);
+    }
 
     let event_loop = EventLoop::with_user_event()
         .build()
@@ -62,6 +82,7 @@ pub fn run() -> browser_core::BrowserResult<()> {
     let mut app = App::Boot {
         waker,
         controller: Some(controller),
+        content_dir: options.content_dir,
     };
     event_loop
         .run_app(&mut app)
@@ -71,7 +92,12 @@ pub fn run() -> browser_core::BrowserResult<()> {
 
 impl ApplicationHandler<WakerEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let App::Boot { waker, controller } = self else {
+        let App::Boot {
+            waker,
+            controller,
+            content_dir,
+        } = self
+        else {
             return;
         };
         let Some(mut controller) = controller.take() else {
@@ -118,7 +144,9 @@ impl ApplicationHandler<WakerEvent> for App {
 
         let mut engine = if browser_core::content_isolation_enabled() {
             let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rust-browser"));
-            let content_dir = controller.store.paths.root.join("content");
+            let content_dir = content_dir
+                .clone()
+                .unwrap_or_else(|| controller.store.paths.root.join("content"));
             // Unix domain sockets have a ~104-byte path limit on macOS; profile
             // paths under Application Support are too long — use /tmp instead.
             let socket_dir = short_ipc_socket_dir();

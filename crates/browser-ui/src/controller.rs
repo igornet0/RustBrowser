@@ -555,6 +555,13 @@ impl BrowserController {
         }
     }
 
+    /// Before the engine starts: make `url` the active tab and skip the restore prompt.
+    pub fn open_startup_url(&mut self, url: Url) {
+        self.address = url.to_string();
+        self.browser.new_tab(Some(url));
+        self.show_restore_prompt = false;
+    }
+
     pub fn new_tab(&mut self, engine: &mut PageBackend) {
         self.show_settings = false;
         self.home_search.clear();

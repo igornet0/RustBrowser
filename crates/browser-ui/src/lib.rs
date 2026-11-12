@@ -15,5 +15,5 @@ mod theme;
 mod waker;
 mod widgets;
 
-pub use app::run;
+pub use app::{run, run_with, LaunchOptions};
 pub use browser_ipc::RemoteContentSession;

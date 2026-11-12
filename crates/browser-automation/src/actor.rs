@@ -22,6 +22,9 @@ const SELECTOR_POLL: Duration = Duration::from_millis(250);
 const LOAD_SHARE: f64 = 0.7;
 /// Time kept back from waiting so the snapshot still fits into the budget.
 const SNAPSHOT_RESERVE: Duration = Duration::from_secs(3);
+/// A wait probe sent while the navigation commits can be lost with the old document;
+/// after this long without a reply it is sent again.
+const PROBE_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// What the actor needs from the Content Process (a seam for tests).
 pub trait ContentDriver {
@@ -80,7 +83,7 @@ pub enum Command {
 #[derive(Debug)]
 enum Stage {
     Loading,
-    WaitCondition { next_poll: Instant, pending: Option<u64> },
+    WaitCondition { next_poll: Instant, pending: Option<(u64, Instant)> },
     Settle { until: Instant },
     Snapshot { rid: u64 },
     Network {
@@ -110,7 +113,7 @@ struct Running {
 impl Running {
     fn pending_rid(&self) -> Option<u64> {
         match self.stage {
-            Stage::WaitCondition { pending, .. } => pending,
+            Stage::WaitCondition { pending, .. } => pending.map(|(rid, _)| rid),
             Stage::Snapshot { rid } | Stage::Script { rid } | Stage::Screenshot { rid } => Some(rid),
             Stage::Network { hook_rid, .. } => Some(hook_rid),
             _ => None,
@@ -337,7 +340,8 @@ fn advance<D: ContentDriver>(driver: &mut D, job: &mut Running, now: Instant) {
         let next = match &mut job.stage {
             Stage::Done => return,
             Stage::Loading => {
-                if !(job.load_complete || now >= job.load_deadline) {
+                let early = job.job.condition.checkable_during_load();
+                if !(early || job.load_complete || now >= job.load_deadline) {
                     return;
                 }
                 if !job.job.condition.is_empty() {
@@ -352,8 +356,12 @@ fn advance<D: ContentDriver>(driver: &mut D, job: &mut Running, now: Instant) {
                 }
             }
             Stage::WaitCondition { next_poll, pending } => {
-                if let Some(rid) = *pending {
+                if let Some((rid, sent)) = *pending {
                     let Some(reply) = driver.take_reply(rid) else {
+                        if now >= sent + PROBE_REPLY_TIMEOUT {
+                            driver.forget_reply(rid);
+                            *pending = None;
+                        }
                         return;
                     };
                     if matches!(script_reply(reply), Ok(Value::Bool(true))) {
@@ -372,7 +380,7 @@ fn advance<D: ContentDriver>(driver: &mut D, job: &mut Running, now: Instant) {
                 } else if now >= *next_poll {
                     match driver.evaluate(job.tab, wait_probe_script(&job.job.condition)) {
                         Ok(rid) => {
-                            *pending = Some(rid);
+                            *pending = Some((rid, now));
                             return;
                         }
                         Err(err) => {
@@ -740,6 +748,52 @@ mod tests {
         let resp = rx.try_recv().unwrap().unwrap();
         assert_eq!(resp.wait_for_found, Some(true));
         assert!(now.duration_since(t0) >= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn selector_found_before_load_completes() {
+        let driver = FakeDriver::new(|script| {
+            Some(Ok(if script.contains("querySelector(\".feed\")") {
+                json!(true)
+            } else {
+                snapshot()
+            }))
+        });
+        let mut actor = Actor::new(driver, 1, 8);
+        let t0 = Instant::now();
+        let mut rx = submit(&mut actor, render_job(|r| r.wait_for = Some(".feed".into())), t0);
+        let mut now = t0;
+        for _ in 0..20 {
+            now += Duration::from_millis(100);
+            actor.tick(now);
+        }
+        let resp = rx.try_recv().expect("done well before the load deadline").unwrap();
+        assert_eq!(resp.wait_for_found, Some(true));
+        assert!(!resp.load_complete);
+    }
+
+    #[test]
+    fn lost_probe_reply_is_resent() {
+        let mut probes = 0;
+        let driver = FakeDriver::new(move |script| {
+            if script.contains("querySelector(\"h1\")") {
+                probes += 1;
+                // The first probe dies with the document it was sent to.
+                (probes > 1).then(|| Ok(json!(true)))
+            } else {
+                Some(Ok(snapshot()))
+            }
+        });
+        let mut actor = Actor::new(driver, 1, 8);
+        let t0 = Instant::now();
+        let mut rx = submit(&mut actor, render_job(|r| r.wait_for = Some("h1".into())), t0);
+        let mut now = t0;
+        for _ in 0..30 {
+            now += Duration::from_millis(100);
+            actor.tick(now);
+        }
+        let resp = rx.try_recv().expect("done after the probe is resent").unwrap();
+        assert_eq!(resp.wait_for_found, Some(true));
     }
 
     #[test]
