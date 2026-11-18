@@ -9,14 +9,14 @@ use browser_core::{is_private_network_url, BrowserError, BrowserResult, TabId};
 use crate::ipc_keymap::{self, parse_ipc_key};
 use browser_ipc::{
     clamp_ipc_frame_size, connect_unix, validate_browser_to_content, BrowserToContent,
-    ContentToBrowser, Envelope, FrameBuffer, InputEventMsg, IpcReader, IpcWriter,
+    ContentToBrowser, CookieInfo, Envelope, FrameBuffer, InputEventMsg, IpcReader, IpcWriter,
     NetworkRequestMsg, NetworkRouteMsg, MAX_NETWORK_LOG, PROTOCOL_VERSION,
 };
 use euclid::Scale;
 use servo::{
-    CompositionEvent, CompositionState, ImeEvent, InputEvent, JSValue, JavaScriptEvaluationError,
-    KeyState, KeyboardEvent, LoadStatus, Modifiers, MouseButton, MouseButtonAction,
-    MouseButtonEvent, MouseMoveEvent, RenderingContext, Servo, ServoBuilder,
+    CompositionEvent, CompositionState, CookieSource, ImeEvent, InputEvent, JSValue,
+    JavaScriptEvaluationError, KeyState, KeyboardEvent, LoadStatus, Modifiers, MouseButton,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, RenderingContext, Servo, ServoBuilder,
     SoftwareRenderingContext, UserContentManager, UserScript, WebResourceLoad,
     WebResourceResponse, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
     WheelMode,
@@ -808,6 +808,30 @@ pub fn run_content_process(
                             .shared
                             .push_reply(rid, ContentToBrowser::NetworkLog { tab_id, requests });
                     }
+                    BrowserToContent::GetCookies { url } => {
+                        let cookies = runtime
+                            .servo
+                            .site_data_manager()
+                            .cookies_for_url(url, CookieSource::HTTP)
+                            .iter()
+                            .map(cookie_info_from_servo)
+                            .collect();
+                        runtime
+                            .shared
+                            .push_reply(rid, ContentToBrowser::Cookies { cookies });
+                    }
+                    BrowserToContent::SetCookies { url, cookies } => {
+                        let manager = runtime.servo.site_data_manager();
+                        for info in cookies {
+                            if let Some(cookie) = cookie_from_info(info) {
+                                manager.set_cookie_for_url(
+                                    url.clone(),
+                                    cookie,
+                                    None,
+                                );
+                            }
+                        }
+                    }
                     BrowserToContent::SetNetworkRoute { mode } => {
                         // Boundary prep only — full Network Core is P2.
                         match mode {
@@ -967,6 +991,61 @@ fn script_error(err: &JavaScriptEvaluationError) -> String {
     }
 }
 
+/// Servo cookie → IPC record. Expiry is Unix seconds; `None` = session cookie.
+fn cookie_info_from_servo(cookie: &cookie::Cookie<'_>) -> CookieInfo {
+    CookieInfo {
+        name: cookie.name().to_string(),
+        value: cookie.value().to_string(),
+        domain: cookie.domain().map(str::to_string),
+        path: cookie.path().map(str::to_string),
+        secure: cookie.secure().unwrap_or(false),
+        http_only: cookie.http_only().unwrap_or(false),
+        same_site: cookie.same_site().map(|value| format!("{value:?}")),
+        expires_unix: expiration_unix(cookie.expires()),
+    }
+}
+
+/// `cookie::Expiration` → Unix seconds (`None` = session cookie).
+fn expiration_unix(expiration: Option<cookie::Expiration>) -> Option<i64> {
+    match expiration? {
+        cookie::Expiration::Session => None,
+        cookie::Expiration::DateTime(value) => Some(value.unix_timestamp()),
+    }
+}
+
+/// IPC cookie record → Servo cookie. Invalid names/values are dropped, never panic.
+fn cookie_from_info(info: CookieInfo) -> Option<cookie::Cookie<'static>> {
+    if info.name.is_empty() || info.name.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let mut builder = cookie::Cookie::build((info.name, info.value));
+    if let Some(domain) = info.domain.filter(|d| !d.is_empty()) {
+        builder = builder.domain(domain);
+    }
+    builder = builder.path(info.path.filter(|p| !p.is_empty()).unwrap_or_else(|| "/".into()));
+    if info.secure {
+        builder = builder.secure(true);
+    }
+    if info.http_only {
+        builder = builder.http_only(true);
+    }
+    if let Some(same_site) = info.same_site.as_deref() {
+        let value = match same_site.to_ascii_lowercase().as_str() {
+            "strict" => cookie::SameSite::Strict,
+            "lax" => cookie::SameSite::Lax,
+            "none" => cookie::SameSite::None,
+            _ => return Some(builder.build()),
+        };
+        builder = builder.same_site(value);
+    }
+    if let Some(unix) = info.expires_unix {
+        if let Ok(when) = cookie::time::OffsetDateTime::from_unix_timestamp(unix) {
+            builder = builder.expires(when);
+        }
+    }
+    Some(builder.build())
+}
+
 fn encode_png_base64(img: &servo::RgbaImage) -> Result<String, String> {
     let mut png = std::io::Cursor::new(Vec::new());
     img.write_to(&mut png, image::ImageFormat::Png)
@@ -977,6 +1056,45 @@ fn encode_png_base64(img: &servo::RgbaImage) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookies_roundtrip_through_ipc_records() {
+        let expires = cookie::time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let original = cookie::Cookie::build(("sid", "abc"))
+            .domain(".example.com")
+            .path("/")
+            .secure(true)
+            .http_only(true)
+            .same_site(cookie::SameSite::Lax)
+            .expires(expires)
+            .build();
+        let info = cookie_info_from_servo(&original);
+        assert_eq!(info.name, "sid");
+        assert_eq!(info.value, "abc");
+        // The cookie crate normalizes a leading dot away.
+        assert_eq!(info.domain.as_deref(), Some("example.com"));
+        assert_eq!(info.path.as_deref(), Some("/"));
+        assert!(info.secure && info.http_only);
+        assert_eq!(info.same_site.as_deref(), Some("Lax"));
+        assert_eq!(info.expires_unix, Some(1_700_000_000));
+
+        let back = cookie_from_info(info.clone()).unwrap();
+        assert_eq!(back.name(), "sid");
+        assert_eq!(back.value(), "abc");
+        assert_eq!(back.domain(), Some("example.com"));
+        assert_eq!(back.path(), Some("/"));
+        assert_eq!(back.secure(), Some(true));
+        assert_eq!(back.http_only(), Some(true));
+        assert_eq!(back.same_site(), Some(cookie::SameSite::Lax));
+        assert_eq!(back.expires(), Some(cookie::Expiration::DateTime(expires)));
+
+        assert!(cookie_from_info(CookieInfo::default()).is_none());
+        assert_eq!(expiration_unix(None), None);
+        assert_eq!(
+            expiration_unix(Some(cookie::Expiration::Session)),
+            None
+        );
+    }
 
     #[test]
     fn js_values_convert_to_json() {

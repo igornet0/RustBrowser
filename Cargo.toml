@@ -12,7 +12,7 @@ members = [
 default-members = ["crates/browser-app"]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "MPL-2.0"
 rust-version = "1.88"
@@ -54,6 +54,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "fs", 
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.15"
 
+cookie = "0.18"
 keyring = "3"
 aes-gcm = "0.10"
 rand = "0.8"

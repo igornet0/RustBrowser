@@ -15,6 +15,7 @@ browser-core = { workspace = true }
 browser-ipc = { workspace = true }
 euclid = { workspace = true }
 servo = { workspace = true }
+cookie = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 url = { workspace = true }

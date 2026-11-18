@@ -3,7 +3,29 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Bump when breaking wire format. Mismatch → content process rejected.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
+
+/// Serializable cookie record used by the session API.
+///
+/// `expires_unix` is the cookie expiry as a Unix timestamp (seconds); `None` means a
+/// session cookie. `same_site` is `"Strict"`, `"Lax"` or `"None"` when present.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CookieInfo {
+    pub name: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub secure: bool,
+    #[serde(default)]
+    pub http_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_unix: Option<i64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope<T> {
@@ -136,6 +158,16 @@ pub enum BrowserToContent {
     SetNetworkRoute {
         mode: NetworkRouteMsg,
     },
+    /// Return cookies for `url` (including HttpOnly) from the public cookie jar.
+    /// Answered by [`ContentToBrowser::Cookies`] with the same `request_id`.
+    GetCookies {
+        url: Url,
+    },
+    /// Import cookies for `url` into the public cookie jar.
+    SetCookies {
+        url: Url,
+        cookies: Vec<CookieInfo>,
+    },
     Heartbeat,
     Shutdown,
 }
@@ -263,6 +295,10 @@ pub enum ContentToBrowser {
     NetworkLog {
         tab_id: TabId,
         requests: Vec<NetworkRequestMsg>,
+    },
+    /// Reply to [`BrowserToContent::GetCookies`] (same `request_id`).
+    Cookies {
+        cookies: Vec<CookieInfo>,
     },
     Error {
         tab_id: Option<TabId>,

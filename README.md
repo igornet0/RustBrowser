@@ -12,6 +12,8 @@ Rust desktop browser powered by Servo.
 - Local user profiles with isolated data directories
 - Basic download manager
 - VPN-ready network policy abstraction (`Direct` today)
+- Headless automation API with multi-account sessions and manual sign-in
+- DeepSeek plugin: send prompts, auto-continue long answers, manage chats
 
 ## Architecture
 
@@ -26,6 +28,9 @@ Servo 0.5.0
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+Automation and multi-account sessions are documented in
+[docs/AUTOMATION.md](docs/AUTOMATION.md).
 
 ## Requirements
 

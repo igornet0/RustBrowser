@@ -213,7 +213,11 @@ impl ContentProcessManager {
         }
         let generation = self.alloc_generation();
         let socket = self.socket_for(id);
-        let child_storage = self.content_dir.join(id.to_string());
+        // Stable per-session storage: a manager owns one content process at a time, so
+        // the profile directory must not depend on the (random) process id. Otherwise
+        // cookies/localStorage are lost on every restart and `--content-dir` sharing
+        // between the UI and the automation server would not work.
+        let child_storage = self.content_dir.clone();
         std::fs::create_dir_all(&child_storage)
             .map_err(|e| BrowserError::Other(e.to_string()))?;
 
@@ -416,6 +420,39 @@ impl ContentProcessManager {
             let _ = std::fs::remove_file(&handle.socket_path);
         }
         Ok(())
+    }
+
+    /// Wait for a content process to exit on its own (e.g. after `Shutdown`).
+    ///
+    /// Servo flushes cookies / auth cache to `<content_dir>` while shutting down.
+    /// Killing the child immediately after sending `Shutdown` loses that state, so
+    /// callers that care about persistence must wait first. Returns `true` when the
+    /// process is gone (or already gone).
+    pub fn wait_for_exit(&mut self, id: ContentProcessId, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let Some(handle) = self.processes.get_mut(&id) else {
+                return true;
+            };
+            let status = handle.child.as_mut().map(|child| child.try_wait());
+            match status {
+                Some(Ok(Some(_))) | None => {
+                    handle.child = None;
+                    handle.pid = None;
+                    handle.force_dead();
+                    return true;
+                }
+                Some(Ok(None)) => {}
+                Some(Err(err)) => {
+                    error!(?err, "content process wait failed");
+                    return false;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     pub fn shutdown_all(&mut self) {

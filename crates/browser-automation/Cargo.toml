@@ -9,7 +9,10 @@ description = "Headless automation HTTP API (render / evaluate / screenshot) ove
 [dependencies]
 browser-core = { workspace = true }
 browser-ipc = { workspace = true }
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+base64 = "0.22"
+http = "1"
+reqwest = { workspace = true }
 tokio = { workspace = true, features = ["net", "time", "signal"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

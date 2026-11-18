@@ -11,8 +11,8 @@ fn tab() -> TabId {
 }
 
 #[test]
-fn protocol_version_is_v4() {
-    assert_eq!(PROTOCOL_VERSION, 4);
+fn protocol_version_is_v5() {
+    assert_eq!(PROTOCOL_VERSION, 5);
 }
 
 #[test]
@@ -112,6 +112,51 @@ fn envelope_sequence_ordering() {
     assert_eq!(env.sequence, 99);
     assert_eq!(env.generation, 3);
     assert_eq!(env.request_id, 7);
+}
+
+#[test]
+fn cookie_messages_roundtrip_and_validate() {
+    use crate::{validate_cookies, CookieInfo};
+    let url = url::Url::parse("https://example.com/").unwrap();
+    let cookie = CookieInfo {
+        name: "sid".into(),
+        value: "abc".into(),
+        domain: Some(".example.com".into()),
+        path: Some("/".into()),
+        secure: true,
+        http_only: true,
+        same_site: Some("Lax".into()),
+        expires_unix: Some(1_700_000_000),
+    };
+
+    let req = Envelope::new(7, BrowserToContent::GetCookies { url: url.clone() });
+    let back: Envelope<BrowserToContent> =
+        serde_json::from_slice(&serde_json::to_vec(&req).unwrap()).unwrap();
+    assert!(matches!(back.payload, BrowserToContent::GetCookies { .. }));
+
+    let reply = Envelope::new(7, ContentToBrowser::Cookies {
+        cookies: vec![cookie.clone()],
+    });
+    let back: Envelope<ContentToBrowser> =
+        serde_json::from_slice(&serde_json::to_vec(&reply).unwrap()).unwrap();
+    match back.payload {
+        ContentToBrowser::Cookies { cookies } => assert_eq!(cookies, vec![cookie.clone()]),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    let set = Envelope::new(
+        8,
+        BrowserToContent::SetCookies {
+            url,
+            cookies: vec![cookie.clone()],
+        },
+    );
+    let back: Envelope<BrowserToContent> =
+        serde_json::from_slice(&serde_json::to_vec(&set).unwrap()).unwrap();
+    assert!(matches!(back.payload, BrowserToContent::SetCookies { .. }));
+
+    validate_cookies(&[cookie]).unwrap();
+    assert!(validate_cookies(&[CookieInfo::default()]).is_err(), "empty name");
 }
 
 #[test]

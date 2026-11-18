@@ -285,6 +285,17 @@ impl RemoteContentSession {
         self.send_with_rid(BrowserToContent::CaptureScreenshot { tab_id })
     }
 
+    /// Read cookies (including HttpOnly) for `url`; the answer arrives via
+    /// [`Self::take_reply`] as [`crate::ContentToBrowser::Cookies`].
+    pub fn get_cookies(&mut self, url: Url) -> BrowserResult<u64> {
+        self.send_with_rid(BrowserToContent::GetCookies { url })
+    }
+
+    /// Import cookies for `url` into the content cookie jar.
+    pub fn set_cookies(&mut self, url: Url, cookies: Vec<crate::CookieInfo>) -> BrowserResult<u64> {
+        self.send_with_rid(BrowserToContent::SetCookies { url, cookies })
+    }
+
     /// Reply to a request/response command, once [`Self::poll`] has received it.
     pub fn take_reply(&mut self, request_id: u64) -> Option<ContentToBrowser> {
         self.pending_replies.remove(&request_id)
@@ -341,7 +352,8 @@ impl RemoteContentSession {
                         }
                         ContentToBrowser::ScriptResult { .. }
                         | ContentToBrowser::Screenshot { .. }
-                        | ContentToBrowser::NetworkLog { .. } => {
+                        | ContentToBrowser::NetworkLog { .. }
+                        | ContentToBrowser::Cookies { .. } => {
                             self.pending_replies.insert(env.request_id, env.payload);
                             continue;
                         }
@@ -517,7 +529,13 @@ impl RemoteContentSession {
     pub fn shutdown(&mut self) {
         self.manager.shutting_down = true;
         self.restart_after = None;
-        let _ = self.send(BrowserToContent::Shutdown);
+        if self.writer.is_some() {
+            let _ = self.send(BrowserToContent::Shutdown);
+            // Give Servo time to flush `cookie_jar.json` / `auth_cache.json` before
+            // the process is killed. Without this wait a restart loses the session.
+            self.manager
+                .wait_for_exit(self.process_id, std::time::Duration::from_secs(3));
+        }
         self.manager.shutdown_all();
         self.writer = None;
         self.reader = None;

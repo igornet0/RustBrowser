@@ -8,7 +8,7 @@ Browser Process = privileged coordinator
  ├── tabs / session / NetworkRouter policy
  ├── Profiles / Credentials / Permissions / Keychain
  └── ContentProcessManager + fail-closed IPC client
-          │ Unix IPC  PROTOCOL_VERSION = 3
+          │ Unix IPC  PROTOCOL_VERSION = 5
           │ generation + sequence + validation
           ▼
 Content Process = untrusted renderer

@@ -1,7 +1,8 @@
 //! IPC limits and fail-closed validation.
 
 use crate::protocol::{
-    BrowserToContent, ContentToBrowser, Envelope, FrameBuffer, InputEventMsg, PROTOCOL_VERSION,
+    BrowserToContent, ContentToBrowser, CookieInfo, Envelope, FrameBuffer, InputEventMsg,
+    PROTOCOL_VERSION,
 };
 use crate::IpcError;
 
@@ -43,6 +44,15 @@ pub const MAX_TEXT_INPUT_LENGTH: usize = 4 * 1024;
 pub const MAX_SCRIPT_LENGTH: usize = 64 * 1024;
 /// Requests kept per tab in the automation network log.
 pub const MAX_NETWORK_LOG: usize = 300;
+
+/// Cookies accepted in one [`BrowserToContent::SetCookies`] / returned by `GetCookies`.
+pub const MAX_COOKIES: usize = 512;
+pub const MAX_COOKIE_NAME: usize = 256;
+/// Google auth cookies can be a few KiB; keep a generous but bounded value.
+pub const MAX_COOKIE_VALUE: usize = 8 * 1024;
+pub const MAX_COOKIE_DOMAIN: usize = 256;
+pub const MAX_COOKIE_PATH: usize = 1024;
+pub const MAX_COOKIE_SAME_SITE: usize = 32;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ValidationError {
@@ -193,6 +203,11 @@ pub fn validate_browser_to_content(msg: &BrowserToContent) -> Result<(), Validat
             }
         }
         BrowserToContent::Input { event, .. } => validate_input(event)?,
+        BrowserToContent::GetCookies { url } => check_url(url)?,
+        BrowserToContent::SetCookies { url, cookies } => {
+            check_url(url)?;
+            validate_cookies(cookies)?;
+        }
         BrowserToContent::EvaluateScript { script, .. } => {
             if script.trim().is_empty() {
                 return Err(ValidationError::InvalidPayload("empty script".into()));
@@ -246,6 +261,7 @@ pub fn validate_content_to_browser(msg: &ContentToBrowser) -> Result<(), Validat
             check_str("error", reason, MAX_STRING_LENGTH)?;
         }
         ContentToBrowser::Frame { frame, .. } => validate_frame(frame)?,
+        ContentToBrowser::Cookies { cookies } => validate_cookies(cookies)?,
         // Script results / screenshots are bounded by MAX_MESSAGE_SIZE at the transport.
         ContentToBrowser::NetworkLog { requests, .. } => {
             if requests.len() > MAX_NETWORK_LOG {
@@ -272,6 +288,33 @@ pub fn validate_content_to_browser(msg: &ContentToBrowser) -> Result<(), Validat
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Validate cookie records crossing the IPC boundary (both directions).
+pub fn validate_cookies(cookies: &[CookieInfo]) -> Result<(), ValidationError> {
+    if cookies.len() > MAX_COOKIES {
+        return Err(ValidationError::InvalidPayload(format!(
+            "too many cookies: {} > {MAX_COOKIES}",
+            cookies.len()
+        )));
+    }
+    for cookie in cookies {
+        if cookie.name.is_empty() {
+            return Err(ValidationError::InvalidPayload("empty cookie name".into()));
+        }
+        check_str("cookie name", &cookie.name, MAX_COOKIE_NAME)?;
+        check_str("cookie value", &cookie.value, MAX_COOKIE_VALUE)?;
+        if let Some(domain) = &cookie.domain {
+            check_str("cookie domain", domain, MAX_COOKIE_DOMAIN)?;
+        }
+        if let Some(path) = &cookie.path {
+            check_str("cookie path", path, MAX_COOKIE_PATH)?;
+        }
+        if let Some(same_site) = &cookie.same_site {
+            check_str("cookie same_site", same_site, MAX_COOKIE_SAME_SITE)?;
+        }
     }
     Ok(())
 }

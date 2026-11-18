@@ -9,16 +9,17 @@ mod transport;
 mod validate;
 
 pub use protocol::{
-    content_msg_tab, BrowserToContent, ContentToBrowser, Envelope, FrameBuffer, InputEventMsg,
-    NetworkRequestMsg, NetworkRouteMsg, PROTOCOL_VERSION,
+    content_msg_tab, BrowserToContent, ContentToBrowser, CookieInfo, Envelope, FrameBuffer,
+    InputEventMsg, NetworkRequestMsg, NetworkRouteMsg, PROTOCOL_VERSION,
 };
 pub use session::RemoteContentSession;
 pub use transport::{connect_unix, listen_unix, IpcError, IpcReader, IpcWriter};
 pub use validate::{
-    checked_frame_bytes, validate_browser_to_content, validate_content_to_browser,
-    clamp_ipc_frame_size, validate_envelope_meta, validate_frame, InboundOrder, ValidationError,
-    MAX_FRAME_BYTES, MAX_FRAME_HEIGHT, MAX_FRAME_WIDTH, MAX_IPC_FRAME_PIXELS, MAX_MESSAGE_SIZE,
-    MAX_NETWORK_LOG, MAX_SCRIPT_LENGTH, MAX_STRING_LENGTH, MAX_URL_LENGTH,
+    checked_frame_bytes, clamp_ipc_frame_size, validate_browser_to_content, validate_content_to_browser,
+    validate_cookies, validate_envelope_meta, validate_frame, InboundOrder, ValidationError,
+    MAX_COOKIES, MAX_COOKIE_DOMAIN, MAX_COOKIE_NAME, MAX_COOKIE_PATH, MAX_COOKIE_SAME_SITE,
+    MAX_COOKIE_VALUE, MAX_FRAME_BYTES, MAX_FRAME_HEIGHT, MAX_FRAME_WIDTH, MAX_IPC_FRAME_PIXELS,
+    MAX_MESSAGE_SIZE, MAX_NETWORK_LOG, MAX_SCRIPT_LENGTH, MAX_STRING_LENGTH, MAX_URL_LENGTH,
 };
 
 #[cfg(test)]
