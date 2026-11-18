@@ -395,7 +395,7 @@ fn draw_general(ui: &mut egui::Ui, controller: &mut BrowserController, engine: &
     widgets::caption(ui, i18n::t(lang, "zoom"));
     let zoom_before = controller.store.settings.default_zoom;
     ui.add(
-        egui::Slider::new(&mut controller.store.settings.default_zoom, 0.5..=2.0)
+        egui::Slider::new(&mut controller.store.settings.default_zoom, 0.25..=3.0)
             .show_value(true)
             .suffix("×"),
     );
@@ -626,7 +626,7 @@ fn draw_advanced(ui: &mut egui::Ui, controller: &mut BrowserController, engine: 
     widgets::caption(ui, i18n::t(lang, "zoom"));
     let zoom_before = controller.store.settings.default_zoom;
     ui.add(
-        egui::Slider::new(&mut controller.store.settings.default_zoom, 0.5..=2.0)
+        egui::Slider::new(&mut controller.store.settings.default_zoom, 0.25..=3.0)
             .text(i18n::t(lang, "zoom"))
             .suffix("×"),
     );

@@ -16,9 +16,11 @@ pub const MAX_FRAME_BYTES: usize = 1920 * 1080 * 4 * 2; // ~16 MiB headroom (2
 pub const MAX_FRAME_WIDTH: u32 = 7680;
 pub const MAX_FRAME_HEIGHT: u32 = 4320;
 
-/// Safe pixel budget for JSON-encoded `FrameBuffer` (`Vec<u8>` → number array ≈ 3–4×).
-/// Keep raw RGBA under ~¼ of [`MAX_MESSAGE_SIZE`] so encode+send does not stall Content.
-pub const MAX_IPC_FRAME_PIXELS: u32 = (MAX_MESSAGE_SIZE / 4 / 4) as u32; // 1_048_576
+/// Safe pixel budget for a base64-encoded `FrameBuffer` on the JSON wire.
+/// Raw RGBA is 4 bytes/px; base64 adds ~4/3, so keep the encoded string
+/// comfortably below [`MAX_MESSAGE_SIZE`]. 3 MP ≈ 2000×1500 (covers FHD and
+/// most of a Retina viewport while still fitting in one message).
+pub const MAX_IPC_FRAME_PIXELS: u32 = 3_000_000; // ~12 MiB raw → ~16 MiB base64
 
 /// Scale `width`×`height` down uniformly so `w*h <= MAX_IPC_FRAME_PIXELS`.
 pub fn clamp_ipc_frame_size(width: u32, height: u32) -> (u32, u32) {
@@ -203,6 +205,13 @@ pub fn validate_browser_to_content(msg: &BrowserToContent) -> Result<(), Validat
             }
         }
         BrowserToContent::Input { event, .. } => validate_input(event)?,
+        BrowserToContent::SetPageZoom { zoom, .. } => {
+            if !zoom.is_finite() || !(0.1..=10.0).contains(zoom) {
+                return Err(ValidationError::InvalidDimensions(
+                    "page zoom out of range".into(),
+                ));
+            }
+        }
         BrowserToContent::GetCookies { url } => check_url(url)?,
         BrowserToContent::SetCookies { url, cookies } => {
             check_url(url)?;

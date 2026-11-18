@@ -11,8 +11,8 @@ fn tab() -> TabId {
 }
 
 #[test]
-fn protocol_version_is_v5() {
-    assert_eq!(PROTOCOL_VERSION, 5);
+fn protocol_version_is_v6() {
+    assert_eq!(PROTOCOL_VERSION, 6);
 }
 
 #[test]
@@ -184,6 +184,10 @@ fn roundtrip_browser_to_content_nav_and_input() {
             width: 800,
             height: 600,
             scale_factor: 2.0,
+        },
+        BrowserToContent::SetPageZoom {
+            tab_id,
+            zoom: 1.5,
         },
         BrowserToContent::Input {
             tab_id,

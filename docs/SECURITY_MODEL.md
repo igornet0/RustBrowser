@@ -47,9 +47,16 @@ Do **not** describe this as a “secure sandbox”, “fully isolated browser”
 - Stale `generation` after Content restart → drop  
 - Duplicate/stale `sequence` → drop  
 
-## Legacy
+## Process model
 
-`RUST_BROWSER_CONTENT=inprocess` → legacy/debug only + WARNING.
+Default: Servo runs **in-process** on the UI thread with the GPU rendering path —
+lowest latency and correct HiDPI/page zoom.
+
+Opt-in isolation: `RUST_BROWSER_CONTENT=isolated` (also `process`, `oop`, `1`)
+runs Servo in a separate Content Process and streams CPU frames over IPC. It is
+more isolated but slower; keep it for testing the process boundary.
+
+`RUST_BROWSER_CONTENT=inprocess` forces the default in-process path.
 
 ## See also
 

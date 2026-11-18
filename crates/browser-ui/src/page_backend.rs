@@ -33,7 +33,16 @@ pub enum PageBackend {
         requested_size: PhysicalSize<u32>,
         /// Servo/IPC framebuffer (may be capped under [`clamp_ipc_frame_size`]).
         page_size: PhysicalSize<u32>,
+        /// Window/UI scale factor (egui pixels per point).
         scale: f64,
+        /// Last requested page zoom; reused when a view is recreated.
+        page_zoom: f32,
+        /// Monotonic version per tab, bumped when a new frame arrives.
+        frame_versions: HashMap<TabId, u64>,
+        frame_counter: u64,
+        /// Cached egui texture per tab (version, handle) — avoids allocating a
+        /// new GPU texture every frame.
+        textures: HashMap<TabId, (u64, egui::TextureHandle)>,
         last_mouse: PhysicalPosition<f64>,
         modifiers: ModifiersState,
         events: Vec<EngineEvent>,
@@ -60,7 +69,7 @@ impl PageBackend {
             pid = ?remote.content_pid(),
             "P1.1 isolated content process attached — Browser owns no Servo"
         );
-        let toolbar = (96.0_f64).max(1.0);
+        let toolbar = (f64::from(crate::theme::size::CHROME_H)).max(1.0);
         let requested = PhysicalSize::new(
             window_size.width.max(1),
             window_size.height.saturating_sub(toolbar as u32).max(1),
@@ -77,6 +86,10 @@ impl PageBackend {
             requested_size: requested,
             page_size: PhysicalSize::new(cw, ch),
             scale: 1.0,
+            page_zoom: 1.0,
+            frame_versions: HashMap::new(),
+            frame_counter: 0,
+            textures: HashMap::new(),
             last_mouse: PhysicalPosition::new(0.0, 0.0),
             modifiers: ModifiersState::default(),
             events: Vec::new(),
@@ -169,11 +182,46 @@ impl PageBackend {
         }
     }
 
+    /// Apply zoom to every view (used as a fallback; the UI prefers
+    /// [`Self::set_view_zoom`] so each tab keeps its own level).
     pub fn set_page_zoom(&mut self, zoom: f32) {
-        if let Self::Legacy(engine) = self {
-            engine.set_page_zoom(zoom);
+        match self {
+            Self::Isolated {
+                remote,
+                focused,
+                page_zoom,
+                ..
+            } => {
+                let zoom = zoom.clamp(0.1, 10.0);
+                *page_zoom = zoom;
+                if let Some(tab) = *focused {
+                    let _ = remote.set_page_zoom(tab, zoom);
+                }
+            }
+            Self::Legacy(engine) => engine.set_page_zoom(zoom),
         }
-        let _ = zoom;
+    }
+
+    /// Apply zoom to one tab's view.
+    pub fn set_view_zoom(&mut self, id: EngineViewId, zoom: f32) {
+        let zoom = if zoom.is_finite() {
+            zoom.clamp(0.1, 10.0)
+        } else {
+            1.0
+        };
+        match self {
+            Self::Isolated {
+                remote, page_zoom, ..
+            } => {
+                *page_zoom = zoom;
+                if let Err(err) = remote.set_page_zoom(id.0, zoom) {
+                    warn!(?err, "set page zoom");
+                }
+            }
+            Self::Legacy(engine) => {
+                engine.set_view_page_zoom(id, zoom);
+            }
+        }
     }
 
     pub fn resize_window(&mut self, size: PhysicalSize<u32>) {
@@ -183,19 +231,45 @@ impl PageBackend {
         }
     }
 
+    /// Push the current viewport to Content. The framebuffer may be smaller
+    /// than the on-screen content area; the hidpi factor is derived from the
+    /// ratio so Servo lays the page out at the *correct CSS viewport size*
+    /// (physical / window-scale) instead of the capped pixel size.
+    fn sync_isolated_viewport(&mut self) {
+        let Self::Isolated {
+            remote,
+            requested_size,
+            page_size,
+            scale,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let req_w = requested_size.width.max(1);
+        let req_h = requested_size.height.max(1);
+        let (w, h) = clamp_ipc_frame_size(req_w, req_h);
+        *page_size = PhysicalSize::new(w, h);
+        let window_scale = if scale.is_finite() && *scale > 0.0 {
+            *scale
+        } else {
+            1.0
+        };
+        // hidpi = window_scale × (framebuffer / requested) keeps
+        // CSS viewport = requested / window_scale.
+        let hidpi = (window_scale * (w as f64 / req_w as f64)).clamp(0.1, 8.0);
+        let _ = remote.resize(w, h, hidpi);
+    }
+
     pub fn set_scale_factor(&mut self, scale: f64) {
         match self {
-            Self::Isolated {
-                scale: s,
-                remote,
-                page_size,
-                requested_size,
-                ..
-            } => {
-                *s = scale;
-                let (w, h) = clamp_ipc_frame_size(requested_size.width, requested_size.height);
-                *page_size = PhysicalSize::new(w, h);
-                let _ = remote.resize(w, h, scale);
+            Self::Isolated { scale: s, .. } => {
+                *s = if scale.is_finite() && scale > 0.0 {
+                    scale
+                } else {
+                    1.0
+                };
+                self.sync_isolated_viewport();
             }
             Self::Legacy(engine) => engine.set_scale_factor(scale),
         }
@@ -240,24 +314,54 @@ impl PageBackend {
         rect: egui::Rect,
         tab: TabId,
     ) {
-        let Self::Isolated { frames, .. } = self else {
+        let Self::Isolated {
+            frames,
+            frame_versions,
+            textures,
+            ..
+        } = self
+        else {
             return;
         };
         // Do not request_frame every egui paint — Content pushes dirty frames on its own.
-        // Spamming RequestFrame on Retina stalls Content on JSON encode and freezes loads.
+        // Spamming RequestFrame on Retina stalls Content on encode and freezes loads.
         if let Some(frame) = frames.get(&tab) {
             if frame.rgba.len()
                 == (frame.width as usize).saturating_mul(frame.height as usize).saturating_mul(4)
             {
-                let color = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba,
-                );
-                let tex = ui.ctx().load_texture(
-                    format!("content-frame-{tab}"),
-                    color,
-                    egui::TextureOptions::LINEAR,
-                );
+                let version = frame_versions.get(&tab).copied().unwrap_or(0);
+                let cached_is_current = textures
+                    .get(&tab)
+                    .map(|(v, _)| *v == version)
+                    .unwrap_or(false);
+                let tex = if cached_is_current {
+                    textures
+                        .get(&tab)
+                        .map(|(_, t)| t.clone())
+                        .expect("checked above")
+                } else {
+                    let color = egui::ColorImage::from_rgba_unmultiplied(
+                        [frame.width as usize, frame.height as usize],
+                        &frame.rgba,
+                    );
+                    match textures.entry(tab) {
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            let (cached_version, tex) = entry.get_mut();
+                            tex.set(color, egui::TextureOptions::LINEAR);
+                            *cached_version = version;
+                            tex.clone()
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let tex = ui.ctx().load_texture(
+                                format!("content-frame-{tab}"),
+                                color,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            entry.insert((version, tex.clone()));
+                            tex
+                        }
+                    }
+                };
                 ui.put(
                     rect,
                     egui::Image::new(&tex).fit_to_exact_size(rect.size()),
@@ -316,10 +420,14 @@ impl PageBackend {
                 frames,
                 nav,
                 focused,
+                frame_versions,
+                textures,
                 ..
             } => {
                 frames.remove(&id.0);
                 nav.remove(&id.0);
+                frame_versions.remove(&id.0);
+                textures.remove(&id.0);
                 if *focused == Some(id.0) {
                     *focused = None;
                 }
@@ -412,17 +520,10 @@ impl PageBackend {
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) -> BrowserResult<()> {
         match self {
-            Self::Isolated {
-                remote,
-                requested_size,
-                page_size,
-                scale,
-                ..
-            } => {
+            Self::Isolated { requested_size, .. } => {
                 *requested_size = size;
-                let (w, h) = clamp_ipc_frame_size(size.width.max(1), size.height.max(1));
-                *page_size = PhysicalSize::new(w, h);
-                remote.resize(w, h, *scale)
+                self.sync_isolated_viewport();
+                Ok(())
             }
             Self::Legacy(engine) => engine.resize(size),
         }
@@ -459,6 +560,8 @@ impl PageBackend {
                 nav,
                 events,
                 needs_tab_restore,
+                frame_versions,
+                frame_counter,
                 ..
             } => {
                 match remote.poll() {
@@ -496,6 +599,8 @@ impl PageBackend {
                                     });
                                 }
                                 ContentToBrowser::Frame { tab_id, frame } => {
+                                    *frame_counter = frame_counter.wrapping_add(1);
+                                    frame_versions.insert(tab_id, *frame_counter);
                                     frames.insert(tab_id, frame);
                                     events.push(EngineEvent::NewFrameReady {
                                         view: EngineViewId(tab_id),

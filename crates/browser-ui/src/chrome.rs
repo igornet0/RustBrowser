@@ -1129,21 +1129,13 @@ fn handle_shortcuts(
         controller.focus_address = true;
     }
     if zoom_in {
-        let z = (controller.store.settings.default_zoom + 0.1).clamp(0.5, 3.0);
-        controller.store.settings.default_zoom = z;
-        engine.set_page_zoom(z);
-        let _ = controller.store.save_settings();
+        controller.zoom_in(engine);
     }
     if zoom_out {
-        let z = (controller.store.settings.default_zoom - 0.1).clamp(0.5, 3.0);
-        controller.store.settings.default_zoom = z;
-        engine.set_page_zoom(z);
-        let _ = controller.store.save_settings();
+        controller.zoom_out(engine);
     }
     if zoom_reset {
-        controller.store.settings.default_zoom = 1.0;
-        engine.set_page_zoom(1.0);
-        let _ = controller.store.save_settings();
+        controller.zoom_reset(engine);
     }
     if arrow_left {
         let id = controller.browser.active_tab;

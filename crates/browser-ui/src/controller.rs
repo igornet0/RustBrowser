@@ -14,6 +14,49 @@ use url::Url;
 pub const SETTINGS_URL: &str = "about:settings";
 pub const NEWTAB_URL: &str = "about:newtab";
 
+/// Discrete browser zoom levels (same idea as Chrome / Safari). Values are
+/// clamped to this range; `1.0` is 100 %.
+pub const ZOOM_STEPS: [f32; 13] = [
+    0.25, 0.33, 0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 3.0,
+];
+
+pub fn normalize_zoom(zoom: f32) -> f32 {
+    if !zoom.is_finite() {
+        return 1.0;
+    }
+    let lo = ZOOM_STEPS[0];
+    let hi = ZOOM_STEPS[ZOOM_STEPS.len() - 1];
+    let rounded = (zoom.clamp(lo, hi) * 100.0).round() / 100.0;
+    // Legacy profiles stored 1.01; snap near-100% values to exactly 100 % so
+    // page frames render at the native device pixel ratio.
+    if (rounded - 1.0).abs() < 0.02 {
+        1.0
+    } else {
+        rounded
+    }
+}
+
+/// Next discrete step above (`dir > 0`) or below (`dir < 0`) `current`.
+fn step_zoom(current: f32, dir: i8) -> f32 {
+    let current = normalize_zoom(current);
+    if dir > 0 {
+        ZOOM_STEPS
+            .iter()
+            .copied()
+            .find(|z| *z > current + 0.0001)
+            .unwrap_or(current)
+    } else if dir < 0 {
+        ZOOM_STEPS
+            .iter()
+            .copied()
+            .rev()
+            .find(|z| *z < current - 0.0001)
+            .unwrap_or(current)
+    } else {
+        current
+    }
+}
+
 pub fn is_settings_url(url: Option<&Url>) -> bool {
     url.map(|u| u.as_str() == SETTINGS_URL).unwrap_or(false)
 }
@@ -125,6 +168,12 @@ pub struct BrowserController {
     pub unclean_exit_detected: bool,
     /// Auto-recover crashed tabs after a short delay.
     pub pending_tab_recoveries: Vec<(TabId, std::time::Instant)>,
+    /// Per-tab page zoom. Tabs without an entry use `settings.default_zoom`.
+    pub tab_zoom: std::collections::HashMap<TabId, f32>,
+    /// Accumulated ⌘/Ctrl + wheel delta (in points) before applying a zoom step.
+    pub zoom_wheel_accum: f32,
+    /// When the current wheel-zoom gesture started (to decay the accumulator).
+    pub zoom_wheel_last: Option<std::time::Instant>,
 }
 
 impl BrowserController {
@@ -219,6 +268,9 @@ impl BrowserController {
             last_window: WindowState::default(),
             unclean_exit_detected: unclean,
             pending_tab_recoveries: Vec::new(),
+            tab_zoom: std::collections::HashMap::new(),
+            zoom_wheel_accum: 0.0,
+            zoom_wheel_last: None,
         })
     }
 
@@ -230,9 +282,104 @@ impl BrowserController {
             if let Err(err) = engine.create_view(view, engine_url_for_tab(url)) {
                 error!(?err, "engine errors");
             }
+            // Each tab keeps its own zoom level.
+            let zoom = self.zoom_for(*id);
+            engine.set_view_zoom(view, zoom);
         }
         let _ = engine.focus_view(EngineViewId(self.browser.active_tab));
-        engine.set_page_zoom(self.store.settings.default_zoom);
+        self.apply_active_zoom(engine);
+    }
+
+    /// Zoom stored for `id`, falling back to the profile default.
+    pub fn zoom_for(&self, id: TabId) -> f32 {
+        normalize_zoom(
+            self.tab_zoom
+                .get(&id)
+                .copied()
+                .unwrap_or(self.store.settings.default_zoom),
+        )
+    }
+
+    pub fn active_zoom(&self) -> f32 {
+        self.zoom_for(self.browser.active_tab)
+    }
+
+    /// Apply the active tab's zoom to the engine (after tab switches / creation).
+    pub fn apply_active_zoom(&mut self, engine: &mut PageBackend) {
+        let id = self.browser.active_tab;
+        let zoom = self.zoom_for(id);
+        engine.set_view_zoom(EngineViewId(id), zoom);
+    }
+
+    /// Set the active tab's zoom (rounded to 2 decimals) and apply it now.
+    pub fn set_active_zoom(&mut self, engine: &mut PageBackend, zoom: f32) {
+        let id = self.browser.active_tab;
+        let zoom = normalize_zoom(zoom);
+        self.tab_zoom.insert(id, zoom);
+        engine.set_view_zoom(EngineViewId(id), zoom);
+    }
+
+    /// Step the active tab zoom up one discrete level.
+    pub fn zoom_in(&mut self, engine: &mut PageBackend) {
+        let next = step_zoom(self.active_zoom(), 1);
+        self.set_active_zoom(engine, next);
+        self.announce_zoom();
+    }
+
+    /// Step the active tab zoom down one discrete level.
+    pub fn zoom_out(&mut self, engine: &mut PageBackend) {
+        let next = step_zoom(self.active_zoom(), -1);
+        self.set_active_zoom(engine, next);
+        self.announce_zoom();
+    }
+
+    /// Reset the active tab to 100 %.
+    pub fn zoom_reset(&mut self, engine: &mut PageBackend) {
+        self.set_active_zoom(engine, 1.0);
+        self.announce_zoom();
+    }
+
+    fn announce_zoom(&mut self) {
+        let percent = (self.active_zoom() * 100.0).round() as i32;
+        self.push_status(format!("Zoom {percent}%"));
+    }
+
+    /// Feed a ⌘/Ctrl + wheel scroll delta; applies discrete zoom steps once the
+    /// accumulated gesture crosses a threshold (`delta_y > 0` = zoom in).
+    pub fn zoom_wheel(&mut self, engine: &mut PageBackend, delta_y: f32) {
+        if !delta_y.is_finite() || delta_y == 0.0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        // New gesture after a pause — drop any leftover accumulation.
+        if let Some(last) = self.zoom_wheel_last {
+            if now.duration_since(last) > std::time::Duration::from_millis(350) {
+                self.zoom_wheel_accum = 0.0;
+            }
+        }
+        self.zoom_wheel_last = Some(now);
+        self.zoom_wheel_accum += delta_y;
+        // One step per ~40 points of accumulated scroll (a trackpad flick or a
+        // couple of mouse-wheel notches).
+        const THRESHOLD: f32 = 40.0;
+        let mut steps = 0i32;
+        while self.zoom_wheel_accum.abs() >= THRESHOLD {
+            let dir = self.zoom_wheel_accum.signum();
+            self.zoom_wheel_accum -= dir * THRESHOLD;
+            steps += if dir > 0.0 { 1 } else { -1 };
+            // Safety: never apply more than 3 steps from a single event.
+            if steps.abs() >= 3 {
+                self.zoom_wheel_accum = 0.0;
+                break;
+            }
+        }
+        if steps != 0 {
+            let mut zoom = self.active_zoom();
+            for _ in 0..steps.abs() {
+                zoom = step_zoom(zoom, if steps > 0 { 1 } else { -1 });
+            }
+            self.set_active_zoom(engine, zoom);
+        }
     }
 
     pub fn apply_engine_events(&mut self, events: Vec<EngineEvent>) {
@@ -389,6 +536,8 @@ impl BrowserController {
             }
         }
         let _ = engine.focus_view(EngineViewId(id));
+        let zoom = self.zoom_for(id);
+        engine.set_view_zoom(EngineViewId(id), zoom);
         self.schedule_session_checkpoint();
         self.push_status("Tab recovered");
     }
@@ -550,6 +699,7 @@ impl BrowserController {
             self.close_active_tab(engine);
         } else {
             let _ = self.browser.close_tab(id);
+            self.tab_zoom.remove(&id);
             let _ = engine.destroy_view(EngineViewId(id));
             self.show_settings = self.settings_tab_active();
         }
@@ -577,13 +727,22 @@ impl BrowserController {
         ) {
             error!(?err, "engine errors");
         }
-        engine.set_page_zoom(self.store.settings.default_zoom);
+        let zoom = normalize_zoom(self.store.settings.default_zoom);
+        self.tab_zoom.insert(id, zoom);
+        engine.set_view_zoom(EngineViewId(id), zoom);
         self.sync_address_from_active();
         self.schedule_session_checkpoint();
     }
 
+    /// Apply the profile's default zoom to every open tab (Settings slider).
     pub fn apply_page_zoom(&mut self, engine: &mut PageBackend) {
-        engine.set_page_zoom(self.store.settings.default_zoom);
+        let zoom = normalize_zoom(self.store.settings.default_zoom);
+        self.store.settings.default_zoom = zoom;
+        let ids: Vec<TabId> = self.browser.tabs.iter().map(|t| t.id).collect();
+        for id in ids {
+            self.tab_zoom.insert(id, zoom);
+            engine.set_view_zoom(EngineViewId(id), zoom);
+        }
     }
 
     pub fn set_home_background_from_path(&mut self, path: std::path::PathBuf) {
@@ -650,6 +809,7 @@ impl BrowserController {
             return;
         }
         let _ = engine.focus_view(EngineViewId(id));
+        self.apply_active_zoom(engine);
         self.sync_address_from_active();
         self.show_settings = self.settings_tab_active();
         self.schedule_session_checkpoint();
@@ -661,13 +821,14 @@ impl BrowserController {
             warn!(?err, "close tab");
             return;
         }
+        self.tab_zoom.remove(&id);
         let _ = engine.destroy_view(EngineViewId(id));
         // If last tab was reset, recreate engine view for new id.
         let active = self.browser.active_tab;
         let url = self.browser.active().ok().and_then(|t| t.url.clone());
         let _ = engine.create_view(EngineViewId(active), engine_url_for_tab(url.clone()));
         let _ = engine.focus_view(EngineViewId(active));
-        engine.set_page_zoom(self.store.settings.default_zoom);
+        self.apply_active_zoom(engine);
         // Chrome new-tab UI: don't leave TabState::Creating (spinner) forever waiting
         // for Servo Complete on an empty / about:blank document.
         if is_new_tab_url(url.as_ref()) {
@@ -692,7 +853,7 @@ impl BrowserController {
             let url = self.browser.tab(id).ok().and_then(|t| t.url.clone());
             let _ = engine.create_view(EngineViewId(id), engine_url_for_tab(url));
             let _ = engine.focus_view(EngineViewId(id));
-            engine.set_page_zoom(self.store.settings.default_zoom);
+            self.apply_active_zoom(engine);
             self.sync_address_from_active();
             self.show_settings = self.settings_tab_active();
         }

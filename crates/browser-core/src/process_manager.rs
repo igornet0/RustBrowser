@@ -475,22 +475,31 @@ pub enum RestartDecision {
     Gone,
 }
 
-/// Whether OOP content isolation is enabled (default: true).
+/// Whether out-of-process content is used for the desktop UI.
 ///
-/// `RUST_BROWSER_CONTENT=inprocess` is **legacy/debug only** and disables process isolation.
+/// Default is **in-process** (`Servo` shares the UI process and paints through the
+/// GPU compositor). That is the only path that gives full-resolution, hardware
+/// accelerated frames, correct page scaling and working page zoom; the IPC path
+/// copies every frame through the CPU.
+///
+/// Opt in to the isolated Content Process with `RUST_BROWSER_CONTENT=isolated`
+/// (aliases: `process`, `oop`, `1`) — used for isolation experiments, automation
+/// and crash-resilience testing.
 pub fn content_isolation_enabled() -> bool {
     match std::env::var("RUST_BROWSER_CONTENT") {
         Ok(v)
-            if v.eq_ignore_ascii_case("inprocess")
-                || v == "0"
-                || v.eq_ignore_ascii_case("local") =>
+            if v.eq_ignore_ascii_case("isolated")
+                || v.eq_ignore_ascii_case("process")
+                || v.eq_ignore_ascii_case("oop")
+                || v == "1" =>
         {
             tracing::warn!(
-                "WARNING: RUST_BROWSER_CONTENT=inprocess is legacy/debug mode. It disables P1 process isolation."
+                "RUST_BROWSER_CONTENT=isolated: frames travel as CPU bitmaps over IPC — \
+                 page rendering will be slower than the default GPU path."
             );
-            false
+            true
         }
-        _ => true,
+        _ => false,
     }
 }
 

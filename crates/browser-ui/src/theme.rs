@@ -26,6 +26,8 @@ pub mod size {
     pub const TAB_H: f32 = 28.0;
     pub const TOOLBAR_H: f32 = 40.0;
     pub const ADDR_H: f32 = 32.0;
+    /// Tab strip (`TAB_H` + 8 px panel padding) plus toolbar.
+    pub const CHROME_H: f32 = TAB_H + 8.0 + TOOLBAR_H;
 }
 
 #[derive(Clone, Copy)]

@@ -384,9 +384,9 @@ impl ContentRuntime {
     }
 
     fn resize(&mut self, width: u32, height: u32, scale: f64) {
-        // Cap framebuffer so JSON IPC frames stay under MAX_MESSAGE_SIZE.
-        // Retina fullscreen (~3k×2k) otherwise stalls Content on serde encode and
-        // LoadStatus never reaches the Browser — spinner hangs forever.
+        // Cap the framebuffer so base64-encoded frames stay under
+        // MAX_MESSAGE_SIZE. The Browser computes the effective hidpi from the
+        // capped size, so the CSS viewport stays correct even when capped.
         let (w, h) = clamp_ipc_frame_size(width.max(1).min(8192), height.max(1).min(8192));
         if w != width || h != height {
             warn!(
@@ -402,11 +402,33 @@ impl ContentRuntime {
             1.0
         };
         self.page_size = size;
-        let _ = self.context.resize(size);
-        for wv in self.views.values() {
-            wv.resize(size);
-            wv.set_hidpi_scale_factor(Scale::new(self.scale as f32));
+        if self.views.is_empty() {
+            let _ = self.context.resize(size);
+        } else {
+            // Resize through WebView only: it resizes the shared context and also
+            // updates the WebRender document view. Resizing the context first makes
+            // WebView::resize early-out and leaves the page at the old viewport.
+            for wv in self.views.values() {
+                wv.resize(size);
+                wv.set_hidpi_scale_factor(Scale::new(self.scale as f32));
+            }
         }
+        if let Ok(mut d) = self.shared.dirty.lock() {
+            *d = true;
+        }
+        self.servo.spin_event_loop();
+    }
+
+    fn set_page_zoom(&mut self, tab_id: TabId, zoom: f32) {
+        let Some(wv) = self.views.get(&tab_id) else {
+            return;
+        };
+        let zoom = if zoom.is_finite() {
+            zoom.clamp(0.1, 10.0)
+        } else {
+            1.0
+        };
+        wv.set_page_zoom(zoom);
         if let Ok(mut d) = self.shared.dirty.lock() {
             *d = true;
         }
@@ -611,11 +633,10 @@ pub fn run_content_process(
         }
     }
     let stream = stream.ok_or_else(|| BrowserError::engine("content ipc connect timeout"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .ok();
     let mut writer = IpcWriter::new(stream.try_clone().map_err(|e| BrowserError::engine(e.to_string()))?);
     let mut reader = IpcReader::new(stream);
+    // Responsive polling loop; message bodies use a long timeout once started.
+    reader.set_read_timeout(Some(Duration::from_millis(10)));
 
     let mut runtime = ContentRuntime::new(storage, host_file, options)?;
     let mut next_id = 1u64;
@@ -758,17 +779,20 @@ pub fn run_content_process(
                         runtime.focus(tab_id);
                         runtime.resize(width, height, scale_factor);
                     }
+                    BrowserToContent::SetPageZoom { tab_id, zoom } => {
+                        runtime.set_page_zoom(tab_id, zoom);
+                    }
                     BrowserToContent::Input { tab_id, event } => {
                         runtime.handle_input(tab_id, event);
                     }
                     BrowserToContent::RequestFrame { tab_id } => {
                         if let Some(frame) = runtime.capture_frame(tab_id) {
                             let raw = frame.byte_len();
-                            // Avoid serde_json encode of oversized RGBA (stalls Content on Retina).
-                            if raw.saturating_mul(4) > browser_ipc::MAX_MESSAGE_SIZE {
+                            // Avoid encoding an oversized base64 frame.
+                            if raw.saturating_mul(4) / 3 > browser_ipc::MAX_MESSAGE_SIZE {
                                 warn!(
                                     raw,
-                                    "skip RequestFrame — would exceed IPC JSON budget"
+                                    "skip RequestFrame — would exceed IPC base64 budget"
                                 );
                             } else {
                                 let seq = out_seq;
@@ -912,12 +936,12 @@ pub fn run_content_process(
             .lock()
             .map(|d| *d)
             .unwrap_or(false);
-        if dirty && runtime.last_frame.elapsed() > Duration::from_millis(100) {
+        if dirty && runtime.last_frame.elapsed() > Duration::from_millis(33) {
             if let Some(tab_id) = runtime.focused {
                 if let Some(frame) = runtime.capture_frame(tab_id) {
                     let raw = frame.byte_len();
-                    if raw.saturating_mul(4) > browser_ipc::MAX_MESSAGE_SIZE {
-                        warn!(raw, "skip dirty frame — would exceed IPC JSON budget");
+                    if raw.saturating_mul(4) / 3 > browser_ipc::MAX_MESSAGE_SIZE {
+                        warn!(raw, "skip dirty frame — would exceed IPC base64 budget");
                         if let Ok(mut d) = runtime.shared.dirty.lock() {
                             *d = false;
                         }
@@ -952,7 +976,7 @@ pub fn run_content_process(
             }
         }
 
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(1));
     }
 
     info!("content process shutdown");

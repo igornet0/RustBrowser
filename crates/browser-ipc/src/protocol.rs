@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Bump when breaking wire format. Mismatch → content process rejected.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Serializable cookie record used by the session API.
 ///
@@ -129,6 +129,11 @@ pub enum BrowserToContent {
         width: u32,
         height: u32,
         scale_factor: f64,
+    },
+    /// Per-tab page zoom (1.0 = 100 %). Applied by Servo to layout and paint.
+    SetPageZoom {
+        tab_id: TabId,
+        zoom: f32,
     },
     Input {
         tab_id: TabId,
@@ -312,7 +317,9 @@ pub enum ContentToBrowser {
 pub struct FrameBuffer {
     pub width: u32,
     pub height: u32,
-    /// RGBA8 row-major pixels (may be empty for placeholder).
+    /// RGBA8 row-major pixels (may be empty for placeholder). Encoded as a
+    /// base64 string on the JSON wire — ~4× smaller than a number array.
+    #[serde(with = "crate::bytes_b64")]
     pub rgba: Vec<u8>,
 }
 

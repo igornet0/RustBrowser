@@ -5,6 +5,8 @@ Rust desktop browser powered by Servo.
 ## Features
 
 - Servo-backed HTML/CSS/JS rendering (no custom engine)
+- GPU-accelerated in-process rendering by default (isolated content process: `RUST_BROWSER_CONTENT=isolated`)
+- Per-tab zoom (⌘+ / ⌘- / ⌘0 and ⌘ + wheel)
 - Address bar and HTTPS navigation
 - Back / Forward / Reload
 - Multiple tabs with keyboard shortcuts

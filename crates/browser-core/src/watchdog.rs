@@ -24,7 +24,9 @@ pub struct WatchdogConfig {
     /// No heartbeat for this long → confirmed hang.
     pub confirmed_after: Duration,
     /// After confirmed hang, exit process so session restore can run (last resort).
-    pub exit_after_confirmed: Duration,
+    /// Disabled by default: a heavy page can block the UI thread for a while and
+    /// killing the whole browser is worse than waiting.
+    pub exit_after_confirmed: Option<Duration>,
     pub poll_interval: Duration,
 }
 
@@ -32,9 +34,9 @@ impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
             // Conservative: slow sites / cold start should not trip this.
-            suspected_after: Duration::from_secs(20),
-            confirmed_after: Duration::from_secs(60),
-            exit_after_confirmed: Duration::from_secs(15),
+            suspected_after: Duration::from_secs(30),
+            confirmed_after: Duration::from_secs(90),
+            exit_after_confirmed: None,
             poll_interval: Duration::from_secs(1),
         }
     }
@@ -88,12 +90,14 @@ impl Watchdog {
                             confirmed_at = Some(std::time::Instant::now());
                         }
                         if let Some(at) = confirmed_at {
-                            if at.elapsed() >= cfg.exit_after_confirmed {
-                                error!(
-                                    "watchdog forcing process exit after confirmed hang — rely on session checkpoint"
-                                );
-                                // Hard last resort: main loop cannot recover if blocked.
-                                std::process::exit(78);
+                            if let Some(exit_after) = cfg.exit_after_confirmed {
+                                if at.elapsed() >= exit_after {
+                                    error!(
+                                        "watchdog forcing process exit after confirmed hang — rely on session checkpoint"
+                                    );
+                                    // Hard last resort: main loop cannot recover if blocked.
+                                    std::process::exit(78);
+                                }
                             }
                         }
                     } else if age >= cfg.suspected_after {

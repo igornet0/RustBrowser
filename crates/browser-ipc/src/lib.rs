@@ -8,6 +8,21 @@ pub mod session;
 mod transport;
 mod validate;
 
+/// Base64 (de)serialization for raw frame bytes on the JSON wire.
+pub(crate) mod bytes_b64 {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
+    }
+}
+
 pub use protocol::{
     content_msg_tab, BrowserToContent, ContentToBrowser, CookieInfo, Envelope, FrameBuffer,
     InputEventMsg, NetworkRequestMsg, NetworkRouteMsg, PROTOCOL_VERSION,

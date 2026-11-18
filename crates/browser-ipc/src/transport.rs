@@ -68,6 +68,8 @@ pub struct IpcReader {
     stream: UnixStream,
     /// When set, inbound envelopes must match this generation.
     pub expected_generation: Option<u64>,
+    /// Idle timeout applied while waiting for the next frame header.
+    read_timeout: Option<Duration>,
 }
 
 impl IpcWriter {
@@ -114,6 +116,7 @@ impl IpcWriter {
         Ok(IpcReader {
             stream: self.stream.try_clone()?,
             expected_generation: Some(self.generation).filter(|g| *g > 0),
+            read_timeout: Some(Duration::from_millis(250)),
         })
     }
 }
@@ -123,10 +126,20 @@ impl IpcReader {
         Self {
             stream,
             expected_generation: None,
+            read_timeout: Some(Duration::from_millis(250)),
         }
     }
 
+    /// Set the idle read timeout (used by polling loops). The body of a message
+    /// that has already started arriving is read with a generous timeout so a
+    /// slow link never truncates a frame mid-message.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+        let _ = self.stream.set_read_timeout(timeout);
+    }
+
     pub fn recv<T: DeserializeOwned>(&mut self) -> Result<Envelope<T>, IpcError> {
+        // Header: may idle-wait under the polling timeout.
         let mut len_buf = [0u8; 4];
         read_exact_retry(&mut self.stream, &mut len_buf)?;
         let len = u32::from_le_bytes(len_buf) as usize;
@@ -136,8 +149,13 @@ impl IpcReader {
         if len == 0 {
             return Err(IpcError::Validation("empty message".into()));
         }
+        // Body: once a header is in, finish the message without the short idle
+        // timeout — otherwise a partially-read body would desync framing.
+        let _ = self.stream.set_read_timeout(Some(Duration::from_secs(30)));
         let mut buf = vec![0u8; len];
-        read_exact_retry(&mut self.stream, &mut buf)?;
+        let read_result = read_exact_retry(&mut self.stream, &mut buf);
+        let _ = self.stream.set_read_timeout(self.read_timeout);
+        read_result?;
         let env: Envelope<T> = serde_json::from_slice(&buf)?;
         validate_envelope_meta(&env, self.expected_generation)?;
         Ok(env)

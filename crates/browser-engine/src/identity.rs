@@ -11,12 +11,47 @@ use servo::{Preferences, UserAgentPlatform};
 const FIREFOX_MAJOR: &str = "140";
 
 /// Build Servo preferences used for every navigation / fetch.
+///
+/// Servo's compiled-in defaults target the engine's test suite, not real websites:
+/// CSS Grid, `@font-face`, IndexedDB, Container Queries and variable fonts are all
+/// disabled out of the box. Browsing a modern site with those off produces broken
+/// layouts, so the web-platform features that are usable in Servo 0.5 are enabled
+/// here. Anything still marked experimental in Servo (Service Workers, WebGPU,
+/// WebRTC) stays off — it is the usual source of wedged pages.
 pub fn build_preferences(locale_override: Option<&str>) -> Preferences {
     let mut preferences = Preferences::default();
     preferences.user_agent = desktop_user_agent();
     if let Some(locale) = locale_override.map(str::trim).filter(|s| !s.is_empty()) {
         preferences.intl_locale_override = locale.to_string();
     }
+
+    // ── CSS ────────────────────────────────────────────────────────────────
+    // Without Grid a large fraction of 2020s sites collapses into a single column.
+    preferences.layout_grid_enabled = true;
+    preferences.layout_container_queries_enabled = true;
+    preferences.layout_columns_enabled = true;
+    preferences.layout_variable_fonts_enabled = true;
+
+    // ── Web fonts ──────────────────────────────────────────────────────────
+    // `@font-face` is off by default, so sites silently fall back to system fonts.
+    preferences.dom_fontface_enabled = true;
+
+    // ── Web platform APIs commonly required by sites ───────────────────────
+    preferences.dom_indexeddb_enabled = true;
+    preferences.dom_adoptedstylesheet_enabled = true;
+    preferences.dom_intersection_observer_enabled = true;
+    preferences.dom_async_clipboard_enabled = true;
+    preferences.dom_web_animations_enabled = true;
+    preferences.dom_offscreen_canvas_enabled = true;
+    preferences.dom_webgl2_enabled = true;
+    preferences.dom_entries_api_enabled = true;
+
+    // ── Navigation / network ──────────────────────────────────────────────
+    // 5 MiB default caps out on large documents and downloads.
+    preferences.network_max_content_length = 128 * 1024 * 1024;
+    // Keep a usable Back history (Servo defaults to 20 entries).
+    preferences.session_history_max_length = 100;
+
     preferences
 }
 

@@ -37,6 +37,10 @@ struct Running {
     next_repaint_at: Option<Instant>,
     watchdog: Watchdog,
     last_checkpoint: Instant,
+    /// `egui.destroy()` must run exactly once (it panics on a second call).
+    shutdown: bool,
+    /// Window is minimized / fully hidden: presenting blocks on macOS.
+    occluded: bool,
 }
 
 /// Startup overrides for the desktop UI (`rust-browser --open <url> --content-dir <dir>`).
@@ -220,7 +224,7 @@ impl ApplicationHandler<WakerEvent> for App {
 
         controller.sync_engine_views(&mut engine);
 
-        let toolbar_height_px = 96.0 * scale;
+        let toolbar_height_px = f64::from(crate::theme::size::CHROME_H) * scale;
         engine.set_content_rect(0.0, toolbar_height_px);
         let _ = engine.set_scale_factor(scale);
 
@@ -241,6 +245,8 @@ impl ApplicationHandler<WakerEvent> for App {
             next_repaint_at: None,
             watchdog: Watchdog::start(WatchdogConfig::default()),
             last_checkpoint: Instant::now(),
+            shutdown: false,
+            occluded: false,
         }));
     }
 
@@ -271,6 +277,10 @@ impl ApplicationHandler<WakerEvent> for App {
                 let _ = state
                     .engine
                     .create_view(browser_engine::EngineViewId(tab.id), url.clone());
+                let zoom = state.controller.zoom_for(tab.id);
+                state
+                    .engine
+                    .set_view_zoom(browser_engine::EngineViewId(tab.id), zoom);
                 if let Some(url) = url {
                     let _ = state
                         .engine
@@ -312,6 +322,14 @@ impl ApplicationHandler<WakerEvent> for App {
             ));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
+        }
+        // Diagnostics mode must keep ticking even when the page is idle so a
+        // blocked script thread is detected.
+        if std::env::var_os("RUST_BROWSER_DIAG").is_some() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(500),
+            ));
+            state.window.request_redraw();
         }
     }
 
@@ -397,6 +415,22 @@ impl ApplicationHandler<WakerEvent> for App {
         let over_page = pointer_in_page_viewport(state, &event);
         let page_receives_pointer = over_page && !chrome_ui_blocks_page(state) && !is_active_chrome_ui(state);
 
+        // ⌘/Ctrl + wheel zooms the page instead of scrolling it. Consume the
+        // event so it is not also forwarded to Servo as a scroll.
+        let zoom_wheel = page_receives_pointer
+            && (state.modifiers.super_key() || state.modifiers.control_key())
+            && matches!(event, WindowEvent::MouseWheel { .. });
+        if zoom_wheel {
+            if let WindowEvent::MouseWheel { delta, .. } = &event {
+                let dy = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => *y * 40.0,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                };
+                state.controller.zoom_wheel(&mut state.engine, dy);
+                state.window.request_redraw();
+            }
+        }
+
         // Servoshell pattern: when interacting with the page, don't let egui keep
         // text-field focus. Give events to egui first for chrome, then to Servo.
         let egui_event_response = state.egui.on_window_event(state.window.as_ref(), &event);
@@ -421,11 +455,13 @@ impl ApplicationHandler<WakerEvent> for App {
             if let Some(pos) = state.last_pointer_px {
                 state.engine.set_last_mouse(pos);
             }
-            state.engine.handle_window_event(
-                &event,
-                state.toolbar_height_px,
-                state.window.scale_factor(),
-            );
+            if !zoom_wheel {
+                state.engine.handle_window_event(
+                    &event,
+                    state.toolbar_height_px,
+                    state.window.scale_factor(),
+                );
+            }
         } else {
             if matches!(
                 event,
@@ -483,15 +519,21 @@ impl ApplicationHandler<WakerEvent> for App {
                 }
                 state.window.request_redraw();
             }
+            WindowEvent::Occluded(occluded) => {
+                state.occluded = occluded;
+                if !occluded {
+                    state.engine.spin();
+                    state.window.request_redraw();
+                }
+            }
             WindowEvent::ScaleFactorChanged {
                 scale_factor, ..
             } => {
                 if scale_factor.is_finite() && scale_factor > 0.0 {
                     state.engine.set_scale_factor(scale_factor);
-                    state
-                        .egui
-                        .egui_ctx
-                        .set_pixels_per_point(scale_factor.clamp(0.5, 4.0) as f32);
+                    // egui_winit already received this event and updated its own
+                    // native pixels-per-point; calling `set_pixels_per_point` here
+                    // would be applied on top of that as a zoom factor.
                 }
                 state.window.request_redraw();
             }
@@ -531,6 +573,10 @@ fn host_file_for_engine(controller: &BrowserController) -> Option<PathBuf> {
 }
 
 fn shutdown_running(state: &mut Running) {
+    if state.shutdown {
+        return;
+    }
+    state.shutdown = true;
     state.waker.retire();
     state.engine.clear_redraw_callback();
     state.egui.destroy();
@@ -539,6 +585,10 @@ fn shutdown_running(state: &mut Running) {
 
 impl Drop for Running {
     fn drop(&mut self) {
+        if self.shutdown {
+            return;
+        }
+        self.shutdown = true;
         self.waker.retire();
         self.engine.clear_redraw_callback();
         self.egui.destroy();
@@ -624,17 +674,23 @@ fn sync_page_layout(
     };
 
     // Servo hidpi must match the scale used for page size / hit-test conversion.
+    // egui owns `pixels_per_point`; never set it from here — doing so feeds its
+    // own zoom factor back into itself and inflates the UI (640×400 viewport).
     if (state.engine.scale_factor() - ppp).abs() > f64::EPSILON {
         state.engine.set_scale_factor(ppp);
-    }
-    if (f64::from(state.egui.egui_ctx.pixels_per_point()) - ppp).abs() > f64::EPSILON {
-        state.egui.egui_ctx.set_pixels_per_point(ppp as f32);
     }
 
     let left_px = (f64::from(content_left_points) * ppp).round();
     let top_px = (f64::from(content_top_points) * ppp).round();
-    let width_px = (f64::from(content_width_points) * ppp).round().max(1.0);
-    let height_px = (f64::from(content_height_points) * ppp).round().max(1.0);
+    // The page can never be larger than the window: clamp so a bad egui rect can
+    // never allocate an 8192² render target or make the page layout at a fake width.
+    let window_px = state.window.inner_size();
+    let width_px = (f64::from(content_width_points) * ppp)
+        .round()
+        .clamp(1.0, f64::from(window_px.width.max(1)));
+    let height_px = (f64::from(content_height_points) * ppp)
+        .round()
+        .clamp(1.0, f64::from(window_px.height.max(1)));
 
     state.page_left_px = left_px;
     state.toolbar_height_px = top_px;
@@ -644,6 +700,16 @@ fn sync_page_layout(
 
     let page_size = winit::dpi::PhysicalSize::new(width_px as u32, height_px as u32);
     if state.engine.page_size() != page_size {
+        tracing::debug!(
+            content_points = %format!(
+                "{:.1}x{:.1} @ ({:.1},{:.1})",
+                content_width_points, content_height_points, content_left_points, content_top_points
+            ),
+            ppp,
+            page_px = %format!("{}x{}", page_size.width, page_size.height),
+            previous = %format!("{}x{}", state.engine.page_size().width, state.engine.page_size().height),
+            "page layout resize"
+        );
         let _ = state.engine.resize(page_size);
     }
 }
@@ -697,6 +763,11 @@ fn is_page_editing_shortcut(key_event: &winit::event::KeyEvent) -> bool {
 }
 
 fn redraw(state: &mut Running) {
+    // Presenting while the window is minimized/hidden blocks on macOS
+    // (surfman waits for a vblank that never arrives). Skip until visible.
+    if state.occluded {
+        return;
+    }
     // Process deferred Servo work (e.g. coalesced mouse moves) once per frame.
     state.watchdog.beat();
     state.engine.spin();
@@ -712,6 +783,16 @@ fn redraw(state: &mut Running) {
     let window = state.window.clone();
 
     let raw_input = state.egui.egui_winit.take_egui_input(window.as_ref());
+    if std::env::var_os("RB_LAYOUT_DEBUG").is_some() {
+        tracing::debug!(
+            inner = %format!("{:?}", window.inner_size()),
+            scale = window.scale_factor(),
+            screen_rect = ?raw_input.screen_rect,
+            viewport = ?raw_input.viewports,
+            ctx_ppp = state.egui.egui_ctx.pixels_per_point(),
+            "egui input"
+        );
+    }
     let full_output = state.egui.egui_ctx.run_ui(raw_input, |ui| {
         let out = draw_chrome(ui, &mut state.controller, &mut state.engine);
         content_left_points = out.content_left_points;

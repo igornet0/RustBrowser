@@ -8,8 +8,7 @@ use browser_core::{
 };
 use crate::{
     content_msg_tab, listen_unix, validate_content_to_browser, BrowserToContent, ContentToBrowser,
-    Envelope, FrameBuffer, InboundOrder, InputEventMsg, IpcError, IpcReader, IpcWriter,
-    PROTOCOL_VERSION,
+    Envelope, InboundOrder, InputEventMsg, IpcError, IpcReader, IpcWriter, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,7 +21,6 @@ pub struct RemoteContentSession {
     pub process_id: ContentProcessId,
     writer: Option<IpcWriter>,
     reader: Option<IpcReader>,
-    pub last_frames: HashMap<TabId, FrameBuffer>,
     pub pending_events: Vec<ContentToBrowser>,
     /// Replies to request/response commands (script, screenshot), keyed by `request_id`.
     pending_replies: HashMap<u64, ContentToBrowser>,
@@ -73,7 +71,6 @@ impl RemoteContentSession {
             process_id,
             writer: None,
             reader: None,
-            last_frames: HashMap::new(),
             pending_events: Vec::new(),
             pending_replies: HashMap::new(),
             crash_loop_locked: false,
@@ -98,9 +95,6 @@ impl RemoteContentSession {
             .accept()
             .map_err(|e| BrowserError::Other(format!("accept content: {e}")))?;
         stream
-            .set_read_timeout(Some(Duration::from_millis(5)))
-            .ok();
-        stream
             .set_write_timeout(Some(Duration::from_secs(5)))
             .ok();
 
@@ -111,6 +105,7 @@ impl RemoteContentSession {
         );
         writer.generation = self.generation;
         let mut reader = IpcReader::new(stream);
+        reader.set_read_timeout(Some(Duration::from_millis(5)));
         // During hello, Content may not yet echo generation; accept gen 0 or current.
         reader.expected_generation = None;
 
@@ -254,6 +249,14 @@ impl RemoteContentSession {
         })
     }
 
+    /// Set the page zoom for one tab (1.0 = 100 %).
+    pub fn set_page_zoom(&mut self, tab_id: TabId, zoom: f32) -> BrowserResult<()> {
+        self.send(BrowserToContent::SetPageZoom {
+            tab_id,
+            zoom: zoom.clamp(0.1, 10.0),
+        })
+    }
+
     pub fn suspend_tab(&mut self, tab_id: TabId) -> BrowserResult<()> {
         self.send(BrowserToContent::SuspendTab { tab_id })
     }
@@ -346,9 +349,6 @@ impl RemoteContentSession {
                     match &env.payload {
                         ContentToBrowser::HeartbeatAck => {
                             self.manager.note_heartbeat(self.process_id);
-                        }
-                        ContentToBrowser::Frame { tab_id, frame } => {
-                            self.last_frames.insert(*tab_id, frame.clone());
                         }
                         ContentToBrowser::ScriptResult { .. }
                         | ContentToBrowser::Screenshot { .. }

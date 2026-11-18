@@ -8,6 +8,7 @@ description = "Framed IPC protocol between Browser Process and Content Process"
 
 [dependencies]
 browser-core = { workspace = true }
+base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

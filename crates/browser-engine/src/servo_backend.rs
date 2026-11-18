@@ -11,10 +11,11 @@ use crate::keyutils::keyboard_event_from_winit;
 use crate::traits::BrowserEngine;
 use euclid::Scale;
 use servo::{
-    CompositionEvent, CompositionState, ImeEvent, InputEvent, LoadStatus, MouseButton,
+    CompositionEvent, CompositionState, ImeEvent, InputEvent, JSValue, LoadStatus, MouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, OffscreenRenderingContext, PrefValue,
-    PermissionFeature, PermissionRequest, RenderingContext, Servo, ServoBuilder, WebView,
-    WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
+    PermissionFeature, PermissionRequest, RenderingContext, Servo, ServoBuilder, UserContentManager,
+    UserScript, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
+    WindowRenderingContext,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -48,6 +49,23 @@ struct ViewState {
     webview: WebView,
 }
 
+/// Drains `window.__rb_log` (see `diag_hook.js`) and reports whether the page's
+/// JS heartbeat is still advancing.
+const DIAG_DRAIN_SCRIPT: &str = r#"(function () {
+  var log = window.__rb_log || [];
+  window.__rb_log = [];
+  return JSON.stringify({
+    now: Date.now(),
+    beat: window.__rb_beat || 0,
+    visibility: document.visibilityState,
+    hidden: !!document.hidden,
+    focus: document.hasFocus ? document.hasFocus() : null,
+    state: document.readyState,
+    url: location.href,
+    logs: log.splice(0, 160)
+  });
+})()"#;
+
 struct SharedState {
     events: Mutex<Vec<EngineEvent>>,
     view_ids: RefCell<HashMap<servo::WebViewId, EngineViewId>>,
@@ -56,6 +74,10 @@ struct SharedState {
     page_dirty: Mutex<bool>,
     /// Returns true if the origin+feature is already Allowed in PermissionManager.
     permission_allowed: Mutex<Option<Box<dyn Fn(String, String) -> bool + Send>>>,
+    /// When a diagnostics evaluation was sent and has not returned yet.
+    diag_pending: Mutex<Option<std::time::Instant>>,
+    /// Whether the current stall has already been reported.
+    diag_stall_reported: Mutex<bool>,
 }
 
 impl SharedState {
@@ -97,6 +119,8 @@ pub struct ServoEngine {
     focused: Option<EngineViewId>,
     shared: Rc<SharedState>,
     page_size: PhysicalSize<u32>,
+    /// Page scripts shared by every view (compat shims for missing Web APIs).
+    user_content: Option<Rc<UserContentManager>>,
     /// Physical-pixel origin of the page content inside the window (matches PaintCallback).
     content_origin_x: f64,
     content_origin_y: f64,
@@ -104,6 +128,9 @@ pub struct ServoEngine {
     page_zoom: f32,
     last_mouse: PhysicalPosition<f64>,
     modifiers: ModifiersState,
+    /// `RUST_BROWSER_DIAG=1`: drain page diagnostics over tracing.
+    diag: bool,
+    last_diag: std::time::Instant,
 }
 
 impl ServoEngine {
@@ -118,9 +145,10 @@ impl ServoEngine {
         );
         let _ = window_context.make_current();
 
-        // Reserve space for chrome; page fills the remainder (min 1x1).
-        // Match browser-ui initial toolbar estimate (~96 CSS px).
-        let toolbar_px = (96.0 * config.scale_factor).round() as u32;
+        // Reserve space for chrome; the page fills the remainder (min 1x1).
+        // This is only the first-frame estimate — browser-ui corrects it with the
+        // real egui content rect before the first paint.
+        let toolbar_px = (76.0 * config.scale_factor).round() as u32;
         let page_h = config.window_size.height.saturating_sub(toolbar_px).max(1);
         let page_size = PhysicalSize::new(config.window_size.width.max(1), page_h);
         let page_context = Rc::new(window_context.offscreen_context(page_size));
@@ -171,7 +199,28 @@ impl ServoEngine {
             request_redraw: Mutex::new(None),
             page_dirty: Mutex::new(true),
             permission_allowed: Mutex::new(None),
+            diag_pending: Mutex::new(None),
+            diag_stall_reported: Mutex::new(false),
         });
+
+        let diag = std::env::var_os("RUST_BROWSER_DIAG").is_some();
+        // Same compat shims as the isolated content process, injected before the
+        // page's own scripts so hydration code can rely on them.
+        let user_content = {
+            let manager = Rc::new(UserContentManager::new(&servo));
+            manager.add_script(Rc::new(UserScript::new(
+                include_str!("compat_shims.js").to_string(),
+                None,
+            )));
+            if diag {
+                manager.add_script(Rc::new(UserScript::new(
+                    include_str!("diag_hook.js").to_string(),
+                    None,
+                )));
+                info!(target: "rb_diag", "page diagnostics enabled");
+            }
+            Some(manager)
+        };
 
         Ok(Self {
             servo,
@@ -181,12 +230,15 @@ impl ServoEngine {
             focused: None,
             shared,
             page_size,
+            user_content,
             content_origin_x: 0.0,
             content_origin_y: toolbar_px as f64,
             scale_factor: config.scale_factor,
             page_zoom: 1.0,
             last_mouse: PhysicalPosition::new(0.0, 0.0),
             modifiers: ModifiersState::default(),
+            diag,
+            last_diag: std::time::Instant::now(),
         })
     }
 
@@ -246,12 +298,41 @@ impl ServoEngine {
 
     /// Apply page zoom to every open WebView (and remember for new views).
     pub fn set_page_zoom(&mut self, zoom: f32) {
-        let zoom = zoom.clamp(0.5, 2.0);
+        // Servo clamps to [0.1, 10.0] internally; keep our copy in the same range.
+        let zoom = if zoom.is_finite() {
+            zoom.clamp(0.1, 10.0)
+        } else {
+            1.0
+        };
+        if (self.page_zoom - zoom).abs() < f32::EPSILON {
+            return;
+        }
         self.page_zoom = zoom;
         for state in self.views.values() {
             state.webview.set_page_zoom(zoom);
         }
         self.shared.mark_page_dirty();
+        self.servo.spin_event_loop();
+    }
+
+    /// Apply zoom to a single tab (per-tab zoom levels). Returns false for an
+    /// unknown view; has no effect when the value is already current.
+    pub fn set_view_page_zoom(&mut self, id: EngineViewId, zoom: f32) -> bool {
+        let zoom = if zoom.is_finite() {
+            zoom.clamp(0.1, 10.0)
+        } else {
+            1.0
+        };
+        let Some(state) = self.views.get(&id) else {
+            return false;
+        };
+        if (state.webview.page_zoom() - zoom).abs() < f32::EPSILON {
+            return true;
+        }
+        state.webview.set_page_zoom(zoom);
+        self.shared.mark_page_dirty();
+        self.servo.spin_event_loop();
+        true
     }
 
     pub fn last_mouse(&self) -> PhysicalPosition<f64> {
@@ -361,6 +442,102 @@ impl ServoEngine {
             view.focus();
             self.servo.spin_event_loop();
         }
+    }
+
+    /// Drain the page diagnostics hook (`RUST_BROWSER_DIAG=1`) once per second.
+    /// If the evaluation does not come back the script thread is blocked; that
+    /// is reported instead of silently looking like a render bug.
+    fn pump_diagnostics(&mut self) {
+        if !self.diag {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Ok(pending) = self.shared.diag_pending.lock() {
+            if let Some(started) = *pending {
+                let stalled = now.duration_since(started);
+                if stalled >= std::time::Duration::from_secs(6) {
+                    if let Ok(mut reported) = self.shared.diag_stall_reported.lock() {
+                        if !*reported {
+                            *reported = true;
+                            warn!(
+                                target: "rb_diag",
+                                stalled_ms = stalled.as_millis() as u64,
+                                "PAGE JS THREAD BLOCKED — diagnostics evaluation has not returned"
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        // Out-of-band command file: lets diagnostics inspect/click the live page.
+        if let Some(path) = std::env::var_os("RB_DIAG_CMD").map(std::path::PathBuf::from) {
+            if path.is_file() {
+                let script = std::fs::read_to_string(&path).unwrap_or_default();
+                let _ = std::fs::remove_file(&path);
+                if !script.trim().is_empty() {
+                    let Some(view) = self.focused_view().cloned() else {
+                        return;
+                    };
+                    if let Ok(mut pending) = self.shared.diag_pending.lock() {
+                        *pending = Some(now);
+                    }
+                    if let Ok(mut reported) = self.shared.diag_stall_reported.lock() {
+                        *reported = false;
+                    }
+                    let shared = self.shared.clone();
+                    view.evaluate_javascript(script, move |result| {
+                        if let Ok(mut pending) = shared.diag_pending.lock() {
+                            *pending = None;
+                        }
+                        if let Ok(mut reported) = shared.diag_stall_reported.lock() {
+                            *reported = false;
+                        }
+                        match result {
+                            Ok(JSValue::String(text)) => {
+                                info!(target: "rb_cmd", "{}", text);
+                            }
+                            Ok(other) => info!(target: "rb_cmd", "result: {:?}", other),
+                            Err(err) => warn!(target: "rb_cmd", ?err, "command failed"),
+                        }
+                    });
+                    return;
+                }
+            }
+        }
+        if now.duration_since(self.last_diag) < std::time::Duration::from_secs(1) {
+            return;
+        }
+        self.last_diag = now;
+        let Some(view) = self.focused_view().cloned() else {
+            return;
+        };
+        if let Ok(mut pending) = self.shared.diag_pending.lock() {
+            *pending = Some(now);
+        }
+        if let Ok(mut reported) = self.shared.diag_stall_reported.lock() {
+            *reported = false;
+        }
+        let shared = self.shared.clone();
+        view.evaluate_javascript(DIAG_DRAIN_SCRIPT, move |result| {
+            if let Ok(mut pending) = shared.diag_pending.lock() {
+                *pending = None;
+            }
+            if let Ok(mut reported) = shared.diag_stall_reported.lock() {
+                *reported = false;
+            }
+            match result {
+                Ok(JSValue::String(text)) => {
+                    info!(target: "rb_diag", "{}", text);
+                }
+                Ok(other) => {
+                    info!(target: "rb_diag", "diagnostics result: {:?}", other);
+                }
+                Err(err) => {
+                    warn!(target: "rb_diag", ?err, "diagnostics evaluation failed");
+                }
+            }
+        });
     }
 
     fn device_point(x: f64, y: f64) -> servo::DevicePoint {
@@ -497,6 +674,12 @@ impl BrowserEngine for ServoEngine {
             return Ok(());
         }
 
+        // All WebViews share one offscreen rendering context, so a visible
+        // background WebView would be composited over the new one.
+        for state in self.views.values() {
+            state.webview.hide();
+        }
+
         let delegate = Rc::new(Delegate {
             shared: self.shared.clone(),
         });
@@ -505,6 +688,10 @@ impl BrowserEngine for ServoEngine {
             WebViewBuilder::new(&self.servo, self.page_context.clone() as Rc<dyn RenderingContext>)
                 .hidpi_scale_factor(Scale::new(self.scale_factor as f32))
                 .delegate(delegate);
+
+        if let Some(manager) = &self.user_content {
+            builder = builder.user_content_manager(manager.clone());
+        }
 
         if let Some(url) = url.clone() {
             builder = builder.url(url);
@@ -699,6 +886,7 @@ impl BrowserEngine for ServoEngine {
 
     fn spin(&mut self) {
         self.servo.spin_event_loop();
+        self.pump_diagnostics();
     }
 
     fn handle_window_event(
