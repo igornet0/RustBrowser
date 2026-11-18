@@ -199,6 +199,8 @@ session, separate from `/fetch`.
      "chat_url": "https://chat.deepseek.com/a/chat/s/…",
      "answer": "…",
      "continued": 0,
+     "thinking_enabled": true,
+     "search_enabled": false,
      "messages": [{"id":"…","role":"user","text":"…","status":"FINISHED"}],
      "elapsed_ms": 18342
    }
@@ -206,6 +208,23 @@ session, separate from `/fetch`.
 
    To continue an existing chat, pass `"chat_id"`. `timeout_ms` defaults to
    180 s (max 900 s), `settle_ms` to 2 s, `max_continues` to 10.
+
+   The composer switches can be set per request:
+
+   ```bash
+   curl -X POST http://127.0.0.1:9333/sessions/work/deepseek/chat \
+     -H 'content-type: application/json' \
+     -d '{"prompt":"What changed in Rust 1.85?","thinking":true,"search":true}'
+   ```
+
+   `thinking` is DeepSeek's "DeepThink" (reasoning) switch, `search` is web
+   search (`deep_thinking` / `smart_search` are accepted as aliases). `true`
+   turns the switch on, `false` turns it off, and omitting it leaves the
+   composer exactly as the page has it. The plugin drives the real switch
+   chips (`.ds-toggle-button`) through their React handler and waits for
+   `aria-pressed` to change before typing, so the outgoing request carries
+   the flags. The result reports the switches that were actually on in
+   `thinking_enabled` / `search_enabled`.
 
    Long answers that hit DeepSeek's length limit show a **Continue** button.
    The button ignores untrusted clicks, so the plugin invokes the button's

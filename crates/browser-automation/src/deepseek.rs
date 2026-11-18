@@ -47,6 +47,13 @@ pub struct DeepSeekChatRequest {
     /// Safety valve for answers that keep asking to continue.
     #[serde(default)]
     pub max_continues: Option<u32>,
+    /// DeepSeek's "DeepThink" reasoning toggle: `true`/`false` forces the
+    /// composer switch before sending, omit to keep whatever the page shows.
+    #[serde(default, alias = "deep_thinking", alias = "deep_think")]
+    pub thinking: Option<bool>,
+    /// DeepSeek's "Search" (web search) toggle; same semantics as `thinking`.
+    #[serde(default, alias = "smart_search", alias = "web_search")]
+    pub search: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +64,8 @@ pub struct DeepSeekChatJob {
     pub timeout: Duration,
     pub settle_ms: u64,
     pub max_continues: u32,
+    pub thinking: Option<bool>,
+    pub search: Option<bool>,
 }
 
 /// `GET /sessions/{id}/deepseek/chats`
@@ -168,6 +177,8 @@ impl DeepSeekJob {
                 "newChat": job.chat_id.is_none(),
                 "settleMs": job.settle_ms,
                 "maxContinues": job.max_continues,
+                "thinking": job.thinking,
+                "search": job.search,
                 "timeoutMs": job.timeout.as_millis().min(u128::from(u64::MAX)) as u64,
             }),
             Self::ListChats { limit } => json!({ "op": "list", "limit": limit }),
@@ -293,6 +304,8 @@ impl DeepSeekChatRequest {
             timeout,
             settle_ms,
             max_continues,
+            thinking: self.thinking,
+            search: self.search,
         })
     }
 }
@@ -501,6 +514,53 @@ const DEEPSEEK_PRELUDE: &str = r#"(() => {
       isStopText(b.getAttribute('aria-label') || '') ||
       isStopText(b.getAttribute('title') || ''));
   }
+  // DeepSeek renders its "DeepThink" and "Search" switches as `.ds-toggle-button`
+  // chips in the composer; `aria-pressed` / `--selected` carry their state.
+  // They are clicked through their React `onClick`, the same handler the user
+  // hits, so the app's own store (and the outgoing payload) stays consistent.
+  const THINK_LABELS = ['deepthink', 'deep think', 'глубокое мышление', 'глубокое размышление', '深度思考', '智能思考'];
+  const SEARCH_LABELS = ['search', 'smart search', 'поиск', 'умный поиск', 'веб-поиск', '联网搜索', '智能搜索'];
+  function composerToggles() {
+    let node = inputEl();
+    for (let depth = 0; depth < 10 && node; depth++, node = node.parentElement) {
+      const list = Array.prototype.slice.call(node.querySelectorAll('.ds-toggle-button'));
+      if (list.length) return list;
+    }
+    return Array.prototype.slice.call(document.querySelectorAll('.ds-toggle-button'));
+  }
+  function findToggle(kind) {
+    const list = composerToggles();
+    const labels = kind === 'thinking' ? THINK_LABELS : SEARCH_LABELS;
+    const byText = list.filter((el) => labels.indexOf(norm(txt(el))) >= 0);
+    if (byText.length) return byText[0];
+    // Unknown locale: the composer renders DeepThink first, then Search.
+    if (list.length === 2) return kind === 'thinking' ? list[0] : list[1];
+    return null;
+  }
+  function toggleEnabled(el) {
+    return el.getAttribute('aria-pressed') === 'true'
+      || el.classList.contains('ds-toggle-button--selected');
+  }
+  function toggleDisabled(el) {
+    return el.getAttribute('aria-disabled') === 'true'
+      || el.classList.contains('ds-toggle-button--disabled');
+  }
+  async function setToggle(kind, want) {
+    const el = await waitFor(() => findToggle(kind), 5000);
+    if (!el) throw new Error('the ' + kind + ' toggle is not available in this chat');
+    if (toggleDisabled(el)) throw new Error('the ' + kind + ' toggle is disabled in this chat');
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (toggleEnabled(el) === want) return;
+      if (!reactClick(el)) el.click();
+      if (await waitFor(() => toggleEnabled(el) === want, 1500)) return;
+      if (!alive()) throw new Error('cancelled');
+    }
+    throw new Error('could not turn ' + (want ? 'on' : 'off') + ' the ' + kind + ' toggle');
+  }
+  function toggleState(kind) {
+    const el = findToggle(kind);
+    return el ? toggleEnabled(el) : null;
+  }
   // The composer's main button becomes the Stop button while a generation is
   // running (empty input + enabled button). The Stop button itself is an icon
   // with no label, so this state check is more reliable than text matching.
@@ -666,6 +726,19 @@ const DEEPSEEK_PRELUDE: &str = r#"(() => {
       }
     }
 
+    // Optional per-request composer switches; applied before typing so the
+    // app's store already holds them when the prompt is submitted.
+    if (CFG.thinking != null || CFG.search != null) {
+      S.phase = 'toggling';
+      if (CFG.thinking != null) await setToggle('thinking', !!CFG.thinking);
+      if (CFG.search != null) await setToggle('search', !!CFG.search);
+      await sleep(200);
+      if (!alive()) throw new Error('cancelled');
+    }
+    // Snapshot what the composer is actually sending with this prompt.
+    const thinkingState = toggleState('thinking');
+    const searchState = toggleState('search');
+
     const initialNode = lastAssistant();
     const initialText = txt(initialNode);
     const initialCount = assistantNodes().length;
@@ -796,6 +869,8 @@ const DEEPSEEK_PRELUDE: &str = r#"(() => {
             chat_url: location.href,
             answer: settledText,
             continued: continues,
+            thinking_enabled: thinkingState,
+            search_enabled: searchState,
             messages: collectMessages()
           });
           return;
@@ -920,6 +995,8 @@ mod tests {
             timeout_ms: None,
             settle_ms: None,
             max_continues: None,
+            thinking: None,
+            search: None,
         }
     }
 
@@ -964,6 +1041,39 @@ mod tests {
         assert_eq!(job.max_continues, 50);
         assert_eq!(DeepSeekChatsQuery { limit: Some(999) }.validate().unwrap(), 200);
         assert_eq!(DeepSeekChatsQuery { limit: None }.validate().unwrap(), 50);
+    }
+
+    #[test]
+    fn chat_switches_reach_the_page() {
+        let job = DeepSeekChatRequest {
+            thinking: Some(true),
+            search: Some(false),
+            ..chat_req("hello")
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(job.thinking, Some(true));
+        assert_eq!(job.search, Some(false));
+        let script = DeepSeekJob::Chat(job).setup_script();
+        assert!(script.contains(r#""thinking":true"#));
+        assert!(script.contains(r#""search":false"#));
+        assert!(script.contains("ds-toggle-button"), "toggle driver missing");
+
+        // Omitted switches leave the composer as the user left it.
+        let plain = chat_req("hello").validate().unwrap();
+        assert_eq!(plain.thinking, None);
+        let script = DeepSeekJob::Chat(plain).setup_script();
+        assert!(script.contains(r#""thinking":null"#));
+    }
+
+    #[test]
+    fn chat_request_accepts_switch_aliases() {
+        let request: DeepSeekChatRequest = serde_json::from_str(
+            r#"{"prompt":"hi","deep_thinking":true,"smart_search":true}"#,
+        )
+        .unwrap();
+        assert_eq!(request.thinking, Some(true));
+        assert_eq!(request.search, Some(true));
     }
 
     #[test]

@@ -164,7 +164,7 @@ mod tests {
         let wd = Watchdog::start(WatchdogConfig {
             suspected_after: Duration::from_secs(30),
             confirmed_after: Duration::from_secs(60),
-            exit_after_confirmed: Duration::from_secs(3600),
+            exit_after_confirmed: Some(Duration::from_secs(3600)),
             poll_interval: Duration::from_millis(50),
         });
         wd.beat();

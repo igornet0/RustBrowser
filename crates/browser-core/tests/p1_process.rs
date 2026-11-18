@@ -36,7 +36,7 @@ fn browser_exe() -> PathBuf {
 
 #[test]
 fn protocol_version_constant() {
-    assert_eq!(PROTOCOL_VERSION, 5);
+    assert_eq!(PROTOCOL_VERSION, 6);
 }
 
 #[test]
@@ -79,8 +79,11 @@ fn crash_loop_protection() {
 
 #[test]
 fn isolation_env_flag() {
-    // Default is OOP enabled unless explicitly forced in-process.
+    // In-process Servo is the default; isolated Content Processes are opt-in
+    // (`RUST_BROWSER_CONTENT=isolated`, see docs/SECURITY_MODEL.md).
     std::env::remove_var("RUST_BROWSER_CONTENT");
+    assert!(!content_isolation_enabled());
+    std::env::set_var("RUST_BROWSER_CONTENT", "isolated");
     assert!(content_isolation_enabled());
     std::env::set_var("RUST_BROWSER_CONTENT", "inprocess");
     assert!(!content_isolation_enabled());

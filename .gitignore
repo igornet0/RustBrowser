@@ -27,3 +27,4 @@ data/profiles/
 *.db
 .idea/
 .vscode/
+.project-log/

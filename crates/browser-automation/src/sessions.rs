@@ -276,6 +276,15 @@ impl SessionRegistry {
 
         let status = wait_with_timeout(&mut child, timeout);
         let timed_out = status.is_none();
+        if let Some(status) = status {
+            if !status.success() {
+                warn!(
+                    session = id,
+                    ?status,
+                    "login window exited with a non-zero status"
+                );
+            }
+        }
         if timed_out {
             warn!(session = id, "login window timed out; killing it");
             let _ = child.kill();

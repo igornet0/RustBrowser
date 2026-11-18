@@ -1649,6 +1649,8 @@ mod tests {
             timeout_ms: Some(60_000),
             settle_ms: None,
             max_continues: None,
+            thinking: None,
+            search: None,
         }
         .validate()
         .map(DeepSeekJob::Chat)

@@ -175,13 +175,19 @@ impl ApplicationHandler<WakerEvent> for App {
                 }
             }
         } else {
+            // In-process Servo keeps cookies and site storage in `config_dir`, so
+            // `--content-dir` has to redirect it here too. The automation login
+            // window relies on this to share a profile with a headless session.
+            let storage_dir = content_dir
+                .clone()
+                .unwrap_or_else(|| controller.store.paths.storage.clone());
             match PageBackend::start_legacy(ServoEngineConfig {
                 display_handle,
                 window_handle,
                 window_size: size,
                 scale_factor: scale,
                 event_loop_waker: Box::new(waker.clone()),
-                config_dir: Some(controller.store.paths.storage.clone()),
+                config_dir: Some(storage_dir),
                 host_file: host_file_for_engine(&controller),
                 locale: Some(controller.store.settings.language.locale_tag().to_string()),
             }) {
@@ -261,6 +267,10 @@ impl ApplicationHandler<WakerEvent> for App {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
+        if state.shutdown {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
         state.watchdog.beat();
         state.controller.tick_recoveries(&mut state.engine);
         // Isolated path: poll IPC even when the Servo waker is absent.
@@ -335,6 +345,9 @@ impl ApplicationHandler<WakerEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: WakerEvent) {
         if let App::Running(state) = self {
+            if state.shutdown {
+                return;
+            }
             state.watchdog.beat();
             state.engine.spin();
             let events = state.engine.poll_events();
@@ -362,6 +375,11 @@ impl ApplicationHandler<WakerEvent> for App {
         let App::Running(state) = self else {
             return;
         };
+        // egui's painter and the GL surface are torn down in `shutdown_running`;
+        // a late redraw/mouse event from macOS must not touch them.
+        if state.shutdown {
+            return;
+        }
 
         // Avoid spinning Servo on every CursorMoved — coalesce into redraw.
         let should_spin_now = matches!(
@@ -763,6 +781,11 @@ fn is_page_editing_shortcut(key_event: &winit::event::KeyEvent) -> bool {
 }
 
 fn redraw(state: &mut Running) {
+    // After `shutdown_running` the egui painter is destroyed; a queued
+    // `RedrawRequested` must not paint into it (it panics).
+    if state.shutdown {
+        return;
+    }
     // Presenting while the window is minimized/hidden blocks on macOS
     // (surfman waits for a vblank that never arrives). Skip until visible.
     if state.occluded {
